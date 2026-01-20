@@ -1,0 +1,107 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Plus Chat</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+    <style>
+        .hidden { display: none !important; }
+        #chat-container { height: 60vh; overflow-y: auto; background: white; border: 1px solid #ddd; padding: 15px; border-radius: 8px; }
+        .message-item { margin-bottom: 10px; padding: 8px 12px; border-radius: 15px; background: #efefef; display: inline-block; clear: both; }
+        .user-name { font-weight: bold; color: #cc0000; font-size: 0.8em; display: block; }
+        .timestamp { font-size: 0.7em; color: #888; margin-left: 8px; }
+        .chat-message { width: 100%; float: left; margin-bottom: 5px; }
+    </style>
+</head>
+<body class="bg-light">
+
+<div id="auth-screen" class="container mt-5">
+    <div class="row justify-content-center">
+        <div class="col-md-4 card p-4 shadow">
+            <h3 id="auth-title" class="text-center mb-4">ログイン</h3>
+            <input type="text" id="username" class="form-control mb-2" placeholder="名前">
+            <input type="password" id="password" class="form-control mb-3" placeholder="パスワード">
+            <button id="auth-btn" class="btn btn-danger w-100 mb-2" onclick="handleAuth()">ログイン</button>
+            <a href="#" onclick="toggleMode()" class="text-center d-block small">新規登録はこちら</a>
+            <p id="error-msg" class="text-danger mt-2 small text-center"></p>
+        </div>
+    </div>
+</div>
+
+<div id="chat-screen" class="container mt-4 hidden">
+    <div class="d-flex justify-content-between mb-2">
+        <strong id="display-name"></strong>
+        <button class="btn btn-sm btn-outline-secondary" onclick="logout()">ログアウト</button>
+    </div>
+    <div id="chat-container" class="mb-3"><div id="messages"></div></div>
+    <div class="input-group">
+        <input type="text" id="message-input" class="form-control" placeholder="送信...">
+        <button class="btn btn-danger" onclick="send()">送信</button>
+    </div>
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.0.1/socket.io.js"></script>
+<script>
+    // URLを自動設定（APIを分けないのでこれでOK）
+    const BACKEND_URL = window.location.origin;
+    let mode = 'login';
+    let socket;
+    let currentUser = "";
+
+    window.onload = () => {
+        const saved = localStorage.getItem('chat_user');
+        if (saved) startChat(saved);
+    };
+
+    function toggleMode() {
+        mode = (mode === 'login') ? 'register' : 'login';
+        document.getElementById('auth-title').innerText = (mode === 'login') ? 'ログイン' : '新規登録';
+    }
+
+    async function handleAuth() {
+        const username = document.getElementById('username').value.trim();
+        const password = document.getElementById('password').value.trim();
+        try {
+            const res = await fetch(`${BACKEND_URL}/api/auth`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ username, password, mode })
+            });
+            const data = await res.json();
+            if (data.success) startChat(data.username);
+            else document.getElementById('error-msg').innerText = data.message;
+        } catch (e) { document.getElementById('error-msg').innerText = "通信エラー"; }
+    }
+
+    function startChat(username) {
+        currentUser = username;
+        localStorage.setItem('chat_user', username);
+        document.getElementById('auth-screen').classList.add('hidden');
+        document.getElementById('chat-screen').classList.remove('hidden');
+        document.getElementById('display-name').innerText = `ユーザー: ${username}`;
+        socket = io(BACKEND_URL);
+        socket.on('receive_message', (m) => displayMsg(m));
+    }
+
+    function logout() { localStorage.removeItem('chat_user'); location.reload(); }
+
+    function displayMsg(data) {
+        const messagesDiv = document.getElementById('messages');
+        const wrapper = document.createElement('div');
+        wrapper.className = 'chat-message';
+        wrapper.innerHTML = `<div class="message-item"><span class="user-name">${data.user}</span>${data.message}<span class="timestamp">${data.time}</span></div>`;
+        messagesDiv.appendChild(wrapper);
+        document.getElementById('chat-container').scrollTop = document.getElementById('chat-container').scrollHeight;
+    }
+
+    function send() {
+        const input = document.getElementById('message-input');
+        if (input.value.trim() && socket) {
+            socket.emit('send_message', { user: currentUser, message: input.value });
+            input.value = '';
+        }
+    }
+</script>
+</body>
+</html>
