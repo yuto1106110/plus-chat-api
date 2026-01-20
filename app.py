@@ -1,50 +1,54 @@
 from flask import Flask, request, jsonify, session
 from flask_socketio import SocketIO, emit
 from flask_sqlalchemy import SQLAlchemy
+from flask_cors import CORS
 from datetime import datetime
 import os
 
 app = Flask(__name__)
-app.config['SECRET_KEY'] = 'your-secret-key' # ログイン管理に必要
-# データベースの設定 (SQLite)
-app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///chat.db'
+app.config['SECRET_KEY'] = 'super-secret-key'
+# Renderの再起動でデータが消えないようSQLiteを使用
+app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///chat_v2.db'
+app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+
+# CORS設定（VercelからのCookie送信を許可）
+CORS(app, supports_credentials=True)
 db = SQLAlchemy(app)
-socketio = SocketIO(app, cors_allowed_origins="*")
+socketio = SocketIO(app, cors_allowed_origins="*", manage_session=False)
 
 # ユーザーモデル
 class User(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     username = db.Column(db.String(20), unique=True, nullable=False)
+    password = db.Column(db.String(20), nullable=False)
 
-# メッセージ履歴（メモリ保持）
+# メッセージ履歴
 messages_log = []
 
-# 初回起動時にデータベースを作成
 with app.app_context():
     db.create_all()
 
-# --- API ルート ---
-
-@app.route('/api/register', methods=['POST'])
-def register():
+@app.route('/api/auth', methods=['POST'])
+def auth():
     data = request.json
     username = data.get('username')
-    if User.query.filter_by(username=username).first():
-        return jsonify({"success": False, "message": "この名前は既に使われています"}), 400
-    
-    new_user = User(username=username)
-    db.session.add(new_user)
-    db.session.commit()
-    session['username'] = username
-    return jsonify({"success": True, "username": username})
+    password = data.get('password')
+    mode = data.get('mode') # 'login' か 'register'
 
-@app.route('/api/check_session')
-def check_session():
-    if 'username' in session:
-        return jsonify({"is_logged_in": True, "username": session['username']})
-    return jsonify({"is_logged_in": False})
+    user = User.query.filter_by(username=username).first()
 
-# --- Socket.IO ---
+    if mode == 'register':
+        if user:
+            return jsonify({"success": False, "message": "この名前は既に存在します"}), 400
+        new_user = User(username=username, password=password)
+        db.session.add(new_user)
+        db.session.commit()
+        return jsonify({"success": True, "username": username})
+
+    else: # login
+        if user and user.password == password:
+            return jsonify({"success": True, "username": username})
+        return jsonify({"success": False, "message": "名前またはパスワードが違います"}), 401
 
 @socketio.on('connect')
 def handle_connect():
@@ -52,10 +56,7 @@ def handle_connect():
 
 @socketio.on('send_message')
 def handle_message(data):
-    # タイムスタンプを追加 (例: 15:30)
-    now = datetime.now()
-    data['time'] = now.strftime("%H:%M")
-    
+    data['time'] = datetime.now().strftime("%H:%M")
     messages_log.append(data)
     if len(messages_log) > 50:
         messages_log.pop(0)
