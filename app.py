@@ -1,24 +1,22 @@
 import os
 from datetime import datetime, timedelta, timezone
-from flask import Flask, request, jsonify
+from flask import Flask, render_template, request, jsonify
 from flask_socketio import SocketIO, emit
 from flask_sqlalchemy import SQLAlchemy
 from flask_cors import CORS
 
 app = Flask(__name__)
-app.config['SECRET_KEY'] = 'super-secret-key'
+app.config['SECRET_KEY'] = 'secret-key-12345'
 
 # データベース設定
-db_path = os.path.join('/tmp', 'chat_v2.db')
+db_path = os.path.join('/tmp', 'chat_final.db')
 app.config['SQLALCHEMY_DATABASE_URI'] = f'sqlite:///{db_path}'
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 
-# CORSを完全に許可
-CORS(app, resources={r"/*": {"origins": "*"}}, supports_credentials=True)
+CORS(app)
+socketio = SocketIO(app, cors_allowed_origins="*")
 
 db = SQLAlchemy(app)
-# async_modeを明示的に指定して安定させます
-socketio = SocketIO(app, cors_allowed_origins="*", async_mode='eventlet')
 
 class User(db.Model):
     id = db.Column(db.Integer, primary_key=True)
@@ -27,25 +25,17 @@ class User(db.Model):
 
 messages_log = []
 
-# 初回のみテーブル作成
 with app.app_context():
     db.create_all()
 
+# --- ここが重要：HTML画面を返す設定 ---
 @app.route('/')
 def index():
-    return "Chat API is running."
-
-
-@app.route('/healthcheck')
-def healthcheck():
-    return 'OK', 200
+    return render_template('index.html')
 
 @app.route('/api/auth', methods=['POST'])
 def auth():
     data = request.get_json()
-    if not data:
-        return jsonify({"success": False, "message": "No data"}), 400
-        
     username = data.get('username', '').strip()
     password = data.get('password', '').strip()
     mode = data.get('mode')
@@ -53,8 +43,7 @@ def auth():
     try:
         user = User.query.filter_by(username=username).first()
         if mode == 'register':
-            if user:
-                return jsonify({"success": False, "message": "既に存在します"}), 400
+            if user: return jsonify({"success": False, "message": "既に存在します"}), 400
             new_user = User(username=username, password=password)
             db.session.add(new_user)
             db.session.commit()
@@ -63,17 +52,16 @@ def auth():
             if user and user.password == password:
                 return jsonify({"success": True, "username": username})
             return jsonify({"success": False, "message": "名前かパスが違います"}), 401
-    except Exception as e:
+    except Exception:
         db.session.rollback()
-        return jsonify({"success": False, "message": "Database Error"}), 500
+        return jsonify({"success": False, "message": "DB Error"}), 500
 
 @socketio.on('send_message')
 def handle_message(data):
     jst = timezone(timedelta(hours=+9))
     data['time'] = datetime.now(jst).strftime("%H:%M")
     messages_log.append(data)
-    if len(messages_log) > 50:
-        messages_log.pop(0)
+    if len(messages_log) > 50: messages_log.pop(0)
     emit('receive_message', data, broadcast=True)
 
 if __name__ == '__main__':
