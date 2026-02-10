@@ -3,7 +3,7 @@
   "version": "1.0.0",
   "main": "index.js",
   "scripts": {
-    "start": "npx prisma generate && node index.js"
+    "start": "node index.js"
   },
   "dependencies": {
     "@prisma/client": "^5.0.0",
