@@ -6,6 +6,7 @@ services:
     plan: free
     region: singapore
     buildCommand: npm install && npx prisma generate
+    # 起動時にDBテーブルを同期し、サーバーを立ち上げる
     startCommand: npx prisma db push && node index.js
     envVars:
       - key: DATABASE_URL
@@ -13,13 +14,13 @@ services:
           name: plus-chat-db
           property: connectionString
       - key: JWT_SECRET
-        generateValue: true # Renderが自動で安全な文字列を作ってくれます
+        generateValue: true
       - key: NODE_VERSION
-        value: 18 # 使用するNodeのバージョンを指定
+        value: 20
 
 databases:
   # データベースの設定
-  - name: chat-db
+  - name: plus-chat-db
     plan: free
     region: singapore
     postgresMajorVersion: 15
