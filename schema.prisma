@@ -13,3 +13,10 @@ model User {
   username String @unique
   password String
 }
+
+model Message {
+  id        Int      @id @default(autoincrement())
+  user      String
+  text      String
+  createdAt DateTime @default(now()) // 送信時間を記録
+}
