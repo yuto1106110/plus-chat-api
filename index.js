@@ -44,11 +44,28 @@ app.post('/api/login', async (req, res) => {
 });
 
 // --- チャット通信 ---
-io.on('connection', (socket) => {
-  socket.on('chat message', (data) => {
-    io.emit('chat message', data); // 全員に転送
+io.on('connection', async (socket) => {
+  // 1. 接続した瞬間に、過去のメッセージを最新50件くらい送ってあげる
+  const pastMessages = await prisma.message.findMany({
+    take: 50,
+    orderBy: { createdAt: 'asc' }
+  });
+  socket.emit('load messages', pastMessages);
+
+  // 2. メッセージを受け取ったらDBに保存してから全員に送る
+  socket.on('chat message', async (data) => {
+    // DBに保存
+    const savedMsg = await prisma.message.create({
+      data: {
+        user: data.user,
+        text: data.text
+      }
+    });
+    // 保存した内容（時間入り）を全員に送る
+    io.emit('chat message', savedMsg); 
   });
 });
+
 
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => console.log(`Run on ${PORT}`));
