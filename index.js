@@ -91,20 +91,3 @@ io.on('connection', async (socket) => {
 });
 
 server.listen(3000, () => console.log('Absolute Server Running on :3000'));
-
-// --- 【緊急用】データベース強制リセットくん ---
-async function emergencyReset() {
-  try {
-    console.log("DBリセットを開始します...");
-    // メッセージを全部消す
-    await prisma.message.deleteMany({});
-    // ユーザーを全部消す
-    await prisma.user.deleteMany({});
-    console.log("DBのリセットが完了しました！このコードを消して再デプロイしてください。");
-  } catch (e) {
-    console.error("リセット失敗:", e);
-  }
-}
-
-// サーバー起動時に実行
-emergencyReset();
