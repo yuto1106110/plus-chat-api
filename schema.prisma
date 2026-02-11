@@ -7,16 +7,21 @@ generator client {
   provider = "prisma-client-js"
 }
 
-// ユーザー情報のテーブル
+// ユーザー情報のテーブル（役職とBANフラグを追加）
 model User {
-  id       Int    @id @default(autoincrement())
-  username String @unique
-  password String
+  id        Int      @id @default(autoincrement())
+  username  String   @unique
+  password  String
+  role      String   @default("USER") // OWNER, ADMIN, MODERATOR, USER
+  isBanned  Boolean  @default(false)
 }
 
+// メッセージテーブル（送信者のIDと役職を記録できるように追加）
 model Message {
   id        Int      @id @default(autoincrement())
   user      String
   text      String
-  createdAt DateTime @default(now()) // 送信時間を記録
+  userId    String   @default("")   // 相手のIDを表示するために必要
+  role      String   @default("USER") // 相手の役職を表示するために必要
+  createdAt DateTime @default(now())
 }
