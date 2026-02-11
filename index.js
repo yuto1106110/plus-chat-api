@@ -15,7 +15,7 @@ const io = new Server(server, { cors: { origin: "*" } });
 app.use(cors());
 app.use(express.json());
 
-const JWT_SECRET = process.env.JWT_SECRET || 'your-secret-key';
+const JWT_SECRET = process.env.JWT_SECRET || 'secret-key';
 const ROLES = { OWNER: 100, ADMIN: 50, USER: 0 };
 let onlineUsers = new Set();
 
@@ -25,9 +25,7 @@ app.post('/api/register', async (req, res) => {
         const hashedPassword = await bcrypt.hash(req.body.password, 10);
         const userCount = await prisma.user.count();
         const role = userCount === 0 ? "OWNER" : "USER";
-        await prisma.user.create({
-            data: { username: req.body.username, password: hashedPassword, role: role }
-        });
+        await prisma.user.create({ data: { username: req.body.username, password: hashedPassword, role } });
         res.json({ success: true });
     } catch (e) { res.status(400).json({ success: false }); }
 });
@@ -46,23 +44,16 @@ io.on('connection', async (socket) => {
     onlineUsers.add(socket.id);
     io.emit('online count', onlineUsers.size);
 
-    const initialMsgs = await prisma.message.findMany({ take: 50, orderBy: { createdAt: 'desc' } });
-    socket.emit('load messages', initialMsgs.reverse());
+    // 初期メッセージ読み込み
+    const msgs = await prisma.message.findMany({ take: 50, orderBy: { createdAt: 'desc' } });
+    socket.emit('load messages', msgs.reverse());
 
     socket.on('chat message', async (data) => {
         const user = await prisma.user.findUnique({ where: { username: data.user } });
         if (!user || user.isBanned || user.isMuted) return;
 
         const newMsg = await prisma.message.create({
-            data: { 
-                user: data.user, 
-                text: data.text, 
-                userId: String(user.id), 
-                role: user.role,
-                // クライアント側でボタンを出し分けるために状態を付与
-                isBanned: user.isBanned,
-                isMuted: user.isMuted
-            }
+            data: { user: data.user, text: data.text, userId: String(user.id), role: user.role, isBanned: user.isBanned, isMuted: user.isMuted }
         });
 
         const count = await prisma.message.count();
@@ -78,41 +69,28 @@ io.on('connection', async (socket) => {
         const tg = await prisma.user.findUnique({ where: { id: Number(data.targetId) } });
         if (!op || !tg) return;
 
-        const opLevel = ROLES[op.role];
-        const tgLevel = ROLES[tg.role];
-
-        // ADMIN以上：格下への操作（削除・ミュート・ミュート解除）
-        if (opLevel >= ROLES.ADMIN && opLevel > tgLevel) {
+        let updateData = {};
+        if (ROLES[op.role] >= ROLES.ADMIN && ROLES[op.role] > ROLES[tg.role]) {
             if (data.type === 'delete') {
                 await prisma.message.delete({ where: { id: Number(data.msgId) } });
-                io.emit('delete message', data.msgId);
-            } else if (data.type === 'mute') {
-                await prisma.user.update({ where: { id: tg.id }, data: { isMuted: true } });
-                io.emit('system message', `${tg.username} をミュートしました`);
-            } else if (data.type === 'unmute') {
-                await prisma.user.update({ where: { id: tg.id }, data: { isMuted: false } });
-                io.emit('system message', `${tg.username} のミュートを解除しました`);
+                return io.emit('delete message', data.msgId);
             }
+            if (data.type === 'mute') updateData = { isMuted: true };
+            if (data.type === 'unmute') updateData = { isMuted: false };
+        }
+        if (op.role === 'OWNER' && op.id !== tg.id) {
+            if (data.type === 'promote') updateData = { role: 'ADMIN' };
+            if (data.type === 'demote') updateData = { role: 'USER' };
+            if (data.type === 'ban') updateData = { isBanned: true };
+            if (data.type === 'unban') updateData = { isBanned: false };
         }
 
-        // OWNER専用：自分以外への人事・BAN操作
-        if (op.role === 'OWNER' && op.id !== tg.id) {
-            if (data.type === 'promote') {
-                await prisma.user.update({ where: { id: tg.id }, data: { role: 'ADMIN' } });
-                io.emit('system message', `${tg.username} をADMINに任命しました`);
-            } else if (data.type === 'demote') {
-                await prisma.user.update({ where: { id: tg.id }, data: { role: 'USER' } });
-                io.emit('system message', `${tg.username} の権限を剥奪しました`);
-            } else if (data.type === 'ban') {
-                await prisma.user.update({ where: { id: tg.id }, data: { isBanned: true } });
-                io.emit('system message', `${tg.username} を追放しました`);
-            } else if (data.type === 'unban') {
-                await prisma.user.update({ where: { id: tg.id }, data: { isBanned: false } });
-                io.emit('system message', `${tg.username} の追放を解除しました`);
-            }
+        if (Object.keys(updateData).length > 0) {
+            const updatedUser = await prisma.user.update({ where: { id: tg.id }, data: updateData });
+            // 全員に最新状態を同期
+            io.emit('user updated', { userId: String(updatedUser.id), role: updatedUser.role, isBanned: updatedUser.isBanned, isMuted: updatedUser.isMuted });
+            io.emit('system message', `${tg.username} の状態が更新されました`);
         }
-        // 状態更新を通知（画面のリロード用など）
-        io.emit('user status updated', { userId: tg.id });
     });
 
     socket.on('disconnect', () => {
