@@ -9,23 +9,24 @@ const { PrismaClient } = require('@prisma/client');
 
 const app = express();
 const prisma = new PrismaClient();
-app.use(cors());
-app.use(express.json());
-
 const server = http.createServer(app);
 const io = new Server(server, { cors: { origin: "*" } });
 
-const JWT_SECRET = process.env.JWT_SECRET || 'secret-key-123';
-const ROLES = { OWNER: 100, ADMIN: 50, MODERATOR: 20, USER: 0 };
+app.use(cors());
+app.use(express.json());
 
-// --- 認証API ---
+const JWT_SECRET = process.env.JWT_SECRET || 'your-secret-key';
+const ROLES = { OWNER: 100, ADMIN: 50, USER: 0 };
+
+// オンライン人数の管理
+let onlineUsers = new Set();
+
+// --- 認証系API ---
 app.post('/api/register', async (req, res) => {
   try {
     const hashedPassword = await bcrypt.hash(req.body.password, 10);
     const userCount = await prisma.user.count();
-    // 最初の1人だけを絶対的管理者(OWNER)にする
     const role = userCount === 0 ? "OWNER" : "USER";
-
     await prisma.user.create({
       data: { username: req.body.username, password: hashedPassword, role: role }
     });
@@ -44,50 +45,70 @@ app.post('/api/login', async (req, res) => {
 
 // --- Socket.io ---
 io.on('connection', async (socket) => {
-  // 接続時に最新50件を送信
+  onlineUsers.add(socket.id);
+  io.emit('online count', onlineUsers.size);
+
   const initialMsgs = await prisma.message.findMany({ take: 50, orderBy: { createdAt: 'desc' } });
   socket.emit('load messages', initialMsgs.reverse());
 
   socket.on('chat message', async (data) => {
     const user = await prisma.user.findUnique({ where: { username: data.user } });
-    if (!user || user.isBanned) return;
+    if (!user || user.isBanned || user.isMuted) return;
 
-    // 1. メッセージ保存
     const newMsg = await prisma.message.create({
       data: { user: data.user, text: data.text, userId: String(user.id), role: user.role }
     });
 
-    // 2. 【50件制限機能】
     const count = await prisma.message.count();
     if (count > 50) {
-      const oldestMessages = await prisma.message.findMany({
-        orderBy: { createdAt: 'asc' },
-        take: count - 50
-      });
-      await prisma.message.deleteMany({
-        where: { id: { in: oldestMessages.map(m => m.id) } }
-      });
+      const oldest = await prisma.message.findMany({ orderBy: { createdAt: 'asc' }, take: count - 50 });
+      await prisma.message.deleteMany({ where: { id: { in: oldest.map(m => m.id) } } });
     }
-
     io.emit('chat message', newMsg);
   });
 
-  // 管理者コマンド
   socket.on('admin command', async (data) => {
     const op = await prisma.user.findUnique({ where: { id: Number(data.myId) } });
     const tg = await prisma.user.findUnique({ where: { id: Number(data.targetId) } });
     if (!op || !tg) return;
 
-    if (ROLES[op.role] <= ROLES[tg.role]) return; // 格上または同格は操作不能
+    const opLevel = ROLES[op.role];
+    const tgLevel = ROLES[tg.role];
 
-    if (data.type === 'ban' && ROLES[op.role] >= ROLES.ADMIN) {
-      await prisma.user.update({ where: { id: tg.id }, data: { isBanned: true } });
-      io.emit('system message', `${tg.username} が追放されました`);
-    } else if (data.type === 'promote' && op.role === 'OWNER') {
-      await prisma.user.update({ where: { id: tg.id }, data: { role: data.newRole } });
-      io.emit('system message', `${tg.username} が ${data.newRole} に任命されました`);
+    // --- ADMIN以上の現場権限 ---
+    if (data.type === 'delete' && opLevel >= ROLES.ADMIN) {
+      await prisma.message.delete({ where: { id: Number(data.msgId) } });
+      io.emit('delete message', data.msgId);
+    } else if (data.type === 'mute' && opLevel >= ROLES.ADMIN && opLevel > tgLevel) {
+      await prisma.user.update({ where: { id: tg.id }, data: { isMuted: true } });
+      io.emit('system message', `${tg.username} がミュートされました`);
     }
+
+    // --- OWNER専用の人事・赦免権限 ---
+    if (op.role === 'OWNER' && op.id !== tg.id) {
+      if (data.type === 'promote') {
+        await prisma.user.update({ where: { id: tg.id }, data: { role: 'ADMIN' } });
+        io.emit('system message', `${tg.username} をADMINに任命しました`);
+      } else if (data.type === 'demote') {
+        await prisma.user.update({ where: { id: tg.id }, data: { role: 'USER' } });
+        io.emit('system message', `${tg.username} の権限を剥奪しました`);
+      } else if (data.type === 'ban') {
+        await prisma.user.update({ where: { id: tg.id }, data: { isBanned: true } });
+        io.emit('system message', `${tg.username} を追放しました`);
+      } else if (data.type === 'unban') {
+        await prisma.user.update({ where: { id: tg.id }, data: { isBanned: false } });
+        io.emit('system message', `${tg.username} の追放を解除しました`);
+      } else if (data.type === 'unmute') {
+        await prisma.user.update({ where: { id: tg.id }, data: { isMuted: false } });
+        io.emit('system message', `${tg.username} のミュートを解除しました`);
+      }
+    }
+  });
+
+  socket.on('disconnect', () => {
+    onlineUsers.delete(socket.id);
+    io.emit('online count', onlineUsers.size);
   });
 });
 
-server.listen(3000, () => console.log('Absolute Server Running on :3000'));
+server.listen(3000, () => console.log('Server running on port 3000'));
