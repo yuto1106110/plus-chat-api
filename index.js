@@ -9,17 +9,17 @@ const { PrismaClient } = require('@prisma/client');
 
 const app = express();
 const prisma = new PrismaClient();
-app.use(cors()); // 他のサイトからの接続を許可
+app.use(cors());
 app.use(express.json());
 
 const server = http.createServer(app);
 const io = new Server(server, {
-  cors: { origin: "*", methods: ["GET", "POST"] } // WebSocketの他サイト接続許可
+  cors: { origin: "*", methods: ["GET", "POST"] }
 });
 
 const JWT_SECRET = process.env.JWT_SECRET || 'secret';
 
-// --- 新規登録 ---
+// --- アカウント系 ---
 app.post('/api/register', async (req, res) => {
   const { username, password } = req.body;
   try {
@@ -31,7 +31,6 @@ app.post('/api/register', async (req, res) => {
   }
 });
 
-// --- ログイン ---
 app.post('/api/login', async (req, res) => {
   const { username, password } = req.body;
   const user = await prisma.user.findUnique({ where: { username } });
@@ -43,29 +42,32 @@ app.post('/api/login', async (req, res) => {
   }
 });
 
-// --- チャット通信 ---
+// --- チャット通信 (最新50件取得) ---
 io.on('connection', async (socket) => {
-  // 1. 接続した瞬間に、過去のメッセージを最新50件くらい送ってあげる
-  const pastMessages = await prisma.message.findMany({
-    take: 50,
-    orderBy: { createdAt: 'asc' }
-  });
-  socket.emit('load messages', pastMessages);
-
-  // 2. メッセージを受け取ったらDBに保存してから全員に送る
-  socket.on('chat message', async (data) => {
-    // DBに保存
-    const savedMsg = await prisma.message.create({
-      data: {
-        user: data.user,
-        text: data.text
-      }
+  try {
+    // 最新の50件を降順(新しい順)で取得
+    const rawMessages = await prisma.message.findMany({
+      take: 50,
+      orderBy: { createdAt: 'desc' }
     });
-    // 保存した内容（時間入り）を全員に送る
-    io.emit('chat message', savedMsg); 
+    // 画面表示用に昇順(古い順)に反転させる
+    const pastMessages = rawMessages.reverse();
+    socket.emit('load messages', pastMessages);
+  } catch (err) {
+    console.error("DB Error:", err);
+  }
+
+  socket.on('chat message', async (data) => {
+    try {
+      const savedMsg = await prisma.message.create({
+        data: { user: data.user, text: data.text }
+      });
+      io.emit('chat message', savedMsg); 
+    } catch (err) {
+      console.error("Save Error:", err);
+    }
   });
 });
 
-
 const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => console.log(`Run on ${PORT}`));
+server.listen(PORT, () => console.log(`Server running on ${PORT}`));
