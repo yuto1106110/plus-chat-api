@@ -42,20 +42,21 @@ app.post('/api/login', async (req, res) => {
   }
 });
 
-// --- チャット通信 (最新50件取得) ---
+// --- チャット通信 (オンライン人数 & 最新50件) ---
+let onlineCount = 0;
+
 io.on('connection', async (socket) => {
+  onlineCount++;
+  io.emit('online count', onlineCount);
+
   try {
-    // 最新の50件を降順(新しい順)で取得
+    // 最新50件を新しい順に取得して、反転（古い順）させて送る
     const rawMessages = await prisma.message.findMany({
       take: 50,
       orderBy: { createdAt: 'desc' }
     });
-    // 画面表示用に昇順(古い順)に反転させる
-    const pastMessages = rawMessages.reverse();
-    socket.emit('load messages', pastMessages);
-  } catch (err) {
-    console.error("DB Error:", err);
-  }
+    socket.emit('load messages', rawMessages.reverse());
+  } catch (err) { console.error(err); }
 
   socket.on('chat message', async (data) => {
     try {
@@ -63,9 +64,12 @@ io.on('connection', async (socket) => {
         data: { user: data.user, text: data.text }
       });
       io.emit('chat message', savedMsg); 
-    } catch (err) {
-      console.error("Save Error:", err);
-    }
+    } catch (err) { console.error(err); }
+  });
+
+  socket.on('disconnect', () => {
+    onlineCount--;
+    io.emit('online count', onlineCount);
   });
 });
 
