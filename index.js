@@ -19,7 +19,7 @@ const JWT_SECRET = process.env.JWT_SECRET || 'secret-key';
 const ROLES = { OWNER: 100, ADMIN: 50, USER: 0 };
 let onlineUsers = new Set();
 
-// --- 認証API ---
+// --- 認証系 ---
 app.post('/api/register', async (req, res) => {
     try {
         const hashedPassword = await bcrypt.hash(req.body.password, 10);
@@ -44,16 +44,23 @@ io.on('connection', async (socket) => {
     onlineUsers.add(socket.id);
     io.emit('online count', onlineUsers.size);
 
-    // 初期メッセージ読み込み
     const msgs = await prisma.message.findMany({ take: 50, orderBy: { createdAt: 'desc' } });
     socket.emit('load messages', msgs.reverse());
 
     socket.on('chat message', async (data) => {
+        if (!data.text || !data.user) return;
         const user = await prisma.user.findUnique({ where: { username: data.user } });
         if (!user || user.isBanned || user.isMuted) return;
 
         const newMsg = await prisma.message.create({
-            data: { user: data.user, text: data.text, userId: String(user.id), role: user.role, isBanned: user.isBanned, isMuted: user.isMuted }
+            data: { 
+                user: data.user, 
+                text: data.text, 
+                userId: String(user.id), 
+                role: user.role, 
+                isBanned: user.isBanned || false, 
+                isMuted: user.isMuted || false 
+            }
         });
 
         const count = await prisma.message.count();
@@ -65,19 +72,24 @@ io.on('connection', async (socket) => {
     });
 
     socket.on('admin command', async (data) => {
+        if (!data.targetId || !data.myId) return; // undefinedガード
         const op = await prisma.user.findUnique({ where: { id: Number(data.myId) } });
         const tg = await prisma.user.findUnique({ where: { id: Number(data.targetId) } });
         if (!op || !tg) return;
 
         let updateData = {};
-        if (ROLES[op.role] >= ROLES.ADMIN && ROLES[op.role] > ROLES[tg.role]) {
-            if (data.type === 'delete') {
+        const opLevel = ROLES[op.role] || 0;
+        const tgLevel = ROLES[tg.role] || 0;
+
+        if (opLevel >= ROLES.ADMIN && opLevel > tgLevel) {
+            if (data.type === 'delete' && data.msgId) {
                 await prisma.message.delete({ where: { id: Number(data.msgId) } });
                 return io.emit('delete message', data.msgId);
             }
             if (data.type === 'mute') updateData = { isMuted: true };
             if (data.type === 'unmute') updateData = { isMuted: false };
         }
+
         if (op.role === 'OWNER' && op.id !== tg.id) {
             if (data.type === 'promote') updateData = { role: 'ADMIN' };
             if (data.type === 'demote') updateData = { role: 'USER' };
@@ -87,9 +99,12 @@ io.on('connection', async (socket) => {
 
         if (Object.keys(updateData).length > 0) {
             const updatedUser = await prisma.user.update({ where: { id: tg.id }, data: updateData });
-            // 全員に最新状態を同期
-            io.emit('user updated', { userId: String(updatedUser.id), role: updatedUser.role, isBanned: updatedUser.isBanned, isMuted: updatedUser.isMuted });
-            io.emit('system message', `${tg.username} の状態が更新されました`);
+            io.emit('user updated', { 
+                userId: String(updatedUser.id), 
+                role: updatedUser.role, 
+                isBanned: updatedUser.isBanned, 
+                isMuted: updatedUser.isMuted 
+            });
         }
     });
 
@@ -100,4 +115,3 @@ io.on('connection', async (socket) => {
 });
 
 server.listen(3000, () => console.log('Server running on 3000'));
-
