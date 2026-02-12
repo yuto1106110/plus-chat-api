@@ -40,71 +40,103 @@ app.post('/api/login', async (req, res) => {
 });
 
 // --- Socket.io ---
+
 io.on('connection', async (socket) => {
+    // オンライン人数
     onlineUsers.add(socket.id);
     io.emit('online count', onlineUsers.size);
 
+    // メッセージ読み込み
     const msgs = await prisma.message.findMany({ take: 50, orderBy: { createdAt: 'desc' } });
     socket.emit('load messages', msgs.reverse());
 
+    // 通常メッセージ送信
     socket.on('chat message', async (data) => {
-        if (!data.text || !data.user) return;
+        // ガード: テキストやユーザー名がない場合は何もしない
+        if (!data || !data.text || !data.user) return;
+
         const user = await prisma.user.findUnique({ where: { username: data.user } });
         if (!user || user.isBanned || user.isMuted) return;
 
-        const newMsg = await prisma.message.create({
-            data: { 
-                user: data.user, 
-                text: data.text, 
-                userId: String(user.id), 
-                role: user.role, 
-                isBanned: user.isBanned || false, 
-                isMuted: user.isMuted || false 
+        try {
+            const newMsg = await prisma.message.create({
+                data: { 
+                    user: data.user, 
+                    text: data.text, 
+                    userId: String(user.id), 
+                    role: user.role, 
+                    isBanned: user.isBanned || false, 
+                    isMuted: user.isMuted || false 
+                }
+            });
+            
+            // 50件制限
+            const count = await prisma.message.count();
+            if (count > 50) {
+                const oldest = await prisma.message.findMany({ orderBy: { createdAt: 'asc' }, take: count - 50 });
+                await prisma.message.deleteMany({ where: { id: { in: oldest.map(m => m.id) } } });
             }
-        });
-
-        const count = await prisma.message.count();
-        if (count > 50) {
-            const oldest = await prisma.message.findMany({ orderBy: { createdAt: 'asc' }, take: count - 50 });
-            await prisma.message.deleteMany({ where: { id: { in: oldest.map(m => m.id) } } });
+            io.emit('chat message', newMsg);
+        } catch (err) {
+            console.error("Message create error:", err);
         }
-        io.emit('chat message', newMsg);
     });
 
+    // 管理コマンド (ここがエラーの主な原因)
     socket.on('admin command', async (data) => {
-        if (!data.targetId || !data.myId) return; // undefinedガード
-        const op = await prisma.user.findUnique({ where: { id: Number(data.myId) } });
-        const tg = await prisma.user.findUnique({ where: { id: Number(data.targetId) } });
-        if (!op || !tg) return;
+        // 【重要】必須データの存在チェック（一つでも欠けていたら即終了）
+        if (!data || !data.type || !data.targetId || !data.myId) {
+            console.log("Admin command ignored: Missing data");
+            return;
+        }
 
-        let updateData = {};
-        const opLevel = ROLES[op.role] || 0;
-        const tgLevel = ROLES[tg.role] || 0;
+        try {
+            const op = await prisma.user.findUnique({ where: { id: Number(data.myId) } });
+            const tg = await prisma.user.findUnique({ where: { id: Number(data.targetId) } });
+            
+            if (!op || !tg) return;
 
-        if (opLevel >= ROLES.ADMIN && opLevel > tgLevel) {
-            if (data.type === 'delete' && data.msgId) {
-                await prisma.message.delete({ where: { id: Number(data.msgId) } });
-                return io.emit('delete message', data.msgId);
+            let updateData = {};
+            const opLevel = ROLES[op.role] || 0;
+            const tgLevel = ROLES[tg.role] || 0;
+
+            // --- ADMIN以上の権限 ---
+            if (opLevel >= ROLES.ADMIN && opLevel > tgLevel) {
+                // メッセージ削除
+                if (data.type === 'delete' && data.msgId) {
+                    await prisma.message.delete({ where: { id: Number(data.msgId) } });
+                    return io.emit('delete message', data.msgId);
+                }
+                // ミュート
+                if (data.type === 'mute') updateData = { isMuted: true };
+                if (data.type === 'unmute') updateData = { isMuted: false };
             }
-            if (data.type === 'mute') updateData = { isMuted: true };
-            if (data.type === 'unmute') updateData = { isMuted: false };
-        }
 
-        if (op.role === 'OWNER' && op.id !== tg.id) {
-            if (data.type === 'promote') updateData = { role: 'ADMIN' };
-            if (data.type === 'demote') updateData = { role: 'USER' };
-            if (data.type === 'ban') updateData = { isBanned: true };
-            if (data.type === 'unban') updateData = { isBanned: false };
-        }
+            // --- OWNER専用の権限 ---
+            if (op.role === 'OWNER' && op.id !== tg.id) {
+                if (data.type === 'promote') updateData = { role: 'ADMIN' };
+                if (data.type === 'demote') updateData = { role: 'USER' };
+                if (data.type === 'ban') updateData = { isBanned: true };
+                if (data.type === 'unban') updateData = { isBanned: false };
+            }
 
-        if (Object.keys(updateData).length > 0) {
-            const updatedUser = await prisma.user.update({ where: { id: tg.id }, data: updateData });
-            io.emit('user updated', { 
-                userId: String(updatedUser.id), 
-                role: updatedUser.role, 
-                isBanned: updatedUser.isBanned, 
-                isMuted: updatedUser.isMuted 
-            });
+            // データベース更新実行
+            if (Object.keys(updateData).length > 0) {
+                const updatedUser = await prisma.user.update({ 
+                    where: { id: tg.id }, 
+                    data: updateData 
+                });
+                
+                // 全員に更新を通知（フロントエンドのキャッシュを更新させるため）
+                io.emit('user updated', { 
+                    userId: String(updatedUser.id), 
+                    role: updatedUser.role, 
+                    isBanned: updatedUser.isBanned, 
+                    isMuted: updatedUser.isMuted 
+                });
+            }
+        } catch (err) {
+            console.error("Admin command error:", err);
         }
     });
 
