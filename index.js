@@ -13,9 +13,7 @@ app.use(cors());
 app.use(express.json());
 
 const ROLES = { OWNER: 100, ADMIN: 50, USER: 0 };
-let onlineUsers = new Set();
 
-// ログイン・登録API
 app.post('/api/register', async (req, res) => {
     try {
         const { username, password } = req.body;
@@ -31,20 +29,17 @@ app.post('/api/login', async (req, res) => {
     try {
         const user = await prisma.user.findUnique({ where: { username } });
         if (user && user.password === password) {
-            if (user.isBanned) return res.json({ success: false, message: 'BAN' });
+            if (user.isBanned) return res.json({ success: false, message: 'BAN中' });
             res.json({ success: true, username: user.username, userId: user.id, role: user.role });
         } else { res.json({ success: false }); }
     } catch (e) { res.json({ success: false }); }
 });
 
 io.on('connection', async (socket) => {
-    onlineUsers.add(socket.id);
-    io.emit('online count', onlineUsers.size);
-
     const msgs = await prisma.message.findMany({ take: 50, orderBy: { createdAt: 'desc' } });
     socket.emit('load messages', msgs.reverse());
 
-    // メッセージ送信（エラー箇所を修正済み）
+    // チャットメッセージ送信 (ここがエラーの原因でした)
     socket.on('chat message', async (data) => {
         if (!data || !data.text || !data.user) return;
         try {
@@ -57,20 +52,14 @@ io.on('connection', async (socket) => {
                     text: data.text, 
                     userId: String(user.id), 
                     role: user.role 
-                    // ログの原因だった isBanned, isMuted はここから削除しました
+                    // 不要な isBanned / isMuted のプロパティを削除しました
                 }
             });
-
-            const count = await prisma.message.count();
-            if (count > 50) {
-                const oldest = await prisma.message.findMany({ orderBy: { createdAt: 'asc' }, take: count - 50 });
-                await prisma.message.deleteMany({ where: { id: { in: oldest.map(m => m.id) } } });
-            }
             io.emit('chat message', newMsg);
         } catch (err) { console.error("Message create error:", err); }
     });
 
-    // 管理コマンド（ミュート修正済み）
+    // 管理コマンド
     socket.on('admin command', async (data) => {
         if (!data || !data.targetId || !data.myId) return;
         try {
@@ -83,14 +72,13 @@ io.on('connection', async (socket) => {
             const tgLevel = ROLES[tg.role] || 0;
 
             if (opLevel >= ROLES.ADMIN && opLevel > tgLevel) {
+                if (data.type === 'mute') updateData = { isMuted: true };
+                if (data.type === 'unmute') updateData = { isMuted: false };
                 if (data.type === 'delete' && data.msgId) {
                     await prisma.message.delete({ where: { id: Number(data.msgId) } });
                     return io.emit('delete message', data.msgId);
                 }
-                if (data.type === 'mute') updateData = { isMuted: true };
-                if (data.type === 'unmute') updateData = { isMuted: false };
             }
-
             if (op.role === 'OWNER' && op.id !== tg.id) {
                 if (data.type === 'ban') updateData = { isBanned: true };
                 if (data.type === 'unban') updateData = { isBanned: false };
@@ -103,11 +91,6 @@ io.on('connection', async (socket) => {
                 io.emit('user updated', { userId: String(updated.id), role: updated.role, isBanned: updated.isBanned, isMuted: updated.isMuted });
             }
         } catch (err) { console.error("Admin command error:", err); }
-    });
-
-    socket.on('disconnect', () => {
-        onlineUsers.delete(socket.id);
-        io.emit('online count', onlineUsers.size);
     });
 });
 
