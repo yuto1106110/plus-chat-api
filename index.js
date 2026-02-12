@@ -15,7 +15,7 @@ app.use(express.json());
 const ROLES = { OWNER: 100, ADMIN: 50, USER: 0 };
 let onlineUsers = new Set();
 
-// 認証API
+// ログイン・登録API
 app.post('/api/register', async (req, res) => {
     try {
         const { username, password } = req.body;
@@ -28,11 +28,13 @@ app.post('/api/register', async (req, res) => {
 
 app.post('/api/login', async (req, res) => {
     const { username, password } = req.body;
-    const user = await prisma.user.findUnique({ where: { username } });
-    if (user && user.password === password) {
-        if (user.isBanned) return res.json({ success: false, message: 'BANされています' });
-        res.json({ success: true, username: user.username, userId: user.id, role: user.role });
-    } else { res.json({ success: false }); }
+    try {
+        const user = await prisma.user.findUnique({ where: { username } });
+        if (user && user.password === password) {
+            if (user.isBanned) return res.json({ success: false, message: 'BAN' });
+            res.json({ success: true, username: user.username, userId: user.id, role: user.role });
+        } else { res.json({ success: false }); }
+    } catch (e) { res.json({ success: false }); }
 });
 
 io.on('connection', async (socket) => {
@@ -42,24 +44,33 @@ io.on('connection', async (socket) => {
     const msgs = await prisma.message.findMany({ take: 50, orderBy: { createdAt: 'desc' } });
     socket.emit('load messages', msgs.reverse());
 
+    // メッセージ送信（エラー箇所を修正済み）
     socket.on('chat message', async (data) => {
         if (!data || !data.text || !data.user) return;
-        const user = await prisma.user.findUnique({ where: { username: data.user } });
-        if (!user || user.isBanned || user.isMuted) return;
-
         try {
+            const user = await prisma.user.findUnique({ where: { username: data.user } });
+            if (!user || user.isBanned || user.isMuted) return;
+
             const newMsg = await prisma.message.create({
-                data: { user: data.user, text: data.text, userId: String(user.id), role: user.role }
+                data: { 
+                    user: data.user, 
+                    text: data.text, 
+                    userId: String(user.id), 
+                    role: user.role 
+                    // ログの原因だった isBanned, isMuted はここから削除しました
+                }
             });
+
             const count = await prisma.message.count();
             if (count > 50) {
                 const oldest = await prisma.message.findMany({ orderBy: { createdAt: 'asc' }, take: count - 50 });
                 await prisma.message.deleteMany({ where: { id: { in: oldest.map(m => m.id) } } });
             }
             io.emit('chat message', newMsg);
-        } catch (err) { console.error(err); }
+        } catch (err) { console.error("Message create error:", err); }
     });
 
+    // 管理コマンド（ミュート修正済み）
     socket.on('admin command', async (data) => {
         if (!data || !data.targetId || !data.myId) return;
         try {
@@ -68,7 +79,10 @@ io.on('connection', async (socket) => {
             if (!op || !tg) return;
 
             let updateData = {};
-            if ((ROLES[op.role] || 0) >= ROLES.ADMIN && (ROLES[op.role] > ROLES[tg.role])) {
+            const opLevel = ROLES[op.role] || 0;
+            const tgLevel = ROLES[tg.role] || 0;
+
+            if (opLevel >= ROLES.ADMIN && opLevel > tgLevel) {
                 if (data.type === 'delete' && data.msgId) {
                     await prisma.message.delete({ where: { id: Number(data.msgId) } });
                     return io.emit('delete message', data.msgId);
@@ -88,7 +102,7 @@ io.on('connection', async (socket) => {
                 const updated = await prisma.user.update({ where: { id: tg.id }, data: updateData });
                 io.emit('user updated', { userId: String(updated.id), role: updated.role, isBanned: updated.isBanned, isMuted: updated.isMuted });
             }
-        } catch (err) { console.error(err); }
+        } catch (err) { console.error("Admin command error:", err); }
     });
 
     socket.on('disconnect', () => {
@@ -98,4 +112,3 @@ io.on('connection', async (socket) => {
 });
 
 server.listen(3000, () => console.log('Server running on 3000'));
-
