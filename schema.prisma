@@ -23,6 +23,4 @@ model Message {
   userId    String   @default("")
   role      String   @default("USER")
   createdAt DateTime @default(now())
-  // 【重要】ここに isBanned や isMuted は含めません。
-  // ログのエラーは、ここに含まれていない項目を書き込もうとしたために発生していました。
 }
