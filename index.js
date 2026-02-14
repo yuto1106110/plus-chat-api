@@ -14,6 +14,7 @@ app.use(express.json());
 
 const ROLES = { OWNER: 100, ADMIN: 50, USER: 0 };
 
+// 登録API
 app.post('/api/register', async (req, res) => {
     try {
         const { username, password } = req.body;
@@ -24,22 +25,24 @@ app.post('/api/register', async (req, res) => {
     } catch (e) { res.json({ success: false }); }
 });
 
+// ログインAPI
 app.post('/api/login', async (req, res) => {
     const { username, password } = req.body;
     try {
         const user = await prisma.user.findUnique({ where: { username } });
         if (user && user.password === password) {
-            if (user.isBanned) return res.json({ success: false, message: 'BAN中' });
+            if (user.isBanned) return res.json({ success: false, message: 'BANされています' });
             res.json({ success: true, username: user.username, userId: user.id, role: user.role });
         } else { res.json({ success: false }); }
     } catch (e) { res.json({ success: false }); }
 });
 
 io.on('connection', async (socket) => {
+    // 履歴読み込み
     const msgs = await prisma.message.findMany({ take: 50, orderBy: { createdAt: 'desc' } });
     socket.emit('load messages', msgs.reverse());
 
-    // チャットメッセージ送信 (ここがエラーの原因でした)
+    // メッセージ送信
     socket.on('chat message', async (data) => {
         if (!data || !data.text || !data.user) return;
         try {
@@ -52,14 +55,13 @@ io.on('connection', async (socket) => {
                     text: data.text, 
                     userId: String(user.id), 
                     role: user.role 
-                    // 不要な isBanned / isMuted のプロパティを削除しました
                 }
             });
             io.emit('chat message', newMsg);
-        } catch (err) { console.error("Message create error:", err); }
+        } catch (err) { console.error("Create error:", err); }
     });
 
-    // 管理コマンド
+    // 管理コマンド (型変換 Number() を徹底)
     socket.on('admin command', async (data) => {
         if (!data || !data.targetId || !data.myId) return;
         try {
@@ -90,8 +92,8 @@ io.on('connection', async (socket) => {
                 const updated = await prisma.user.update({ where: { id: tg.id }, data: updateData });
                 io.emit('user updated', { userId: String(updated.id), role: updated.role, isBanned: updated.isBanned, isMuted: updated.isMuted });
             }
-        } catch (err) { console.error("Admin command error:", err); }
+        } catch (err) { console.error("Admin error:", err); }
     });
 });
 
-server.listen(3000, () => console.log('Server running on 3000'));
+server.listen(3000, () => console.log('Server is running!'));
