@@ -8,12 +8,13 @@ generator client {
 }
 
 model User {
-  id        Int      @id @default(autoincrement())
-  username  String   @unique
-  password  String
-  role      String   @default("USER")
-  isBanned  Boolean  @default(false)
-  isMuted   Boolean  @default(false)
+  id         Int       @id @default(autoincrement())
+  username   String    @unique
+  password   String
+  role       String    @default("USER")
+  isBanned   Boolean   @default(false)
+  isMuted    Boolean   @default(false)
+  muteUntil  DateTime? // ミュートが自動解除される時間（空なら永遠または未ミュート）
 }
 
 model Message {
