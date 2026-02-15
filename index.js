@@ -7,37 +7,78 @@ const cors = require('cors');
 const app = express();
 const prisma = new PrismaClient();
 const server = http.createServer(app);
-const io = new Server(server, { cors: { origin: "*" } });
 
-app.use(cors());
+// --- 修正ポイント1: CORSを全許可に ---
+app.use(cors()); 
+
+const io = new Server(server, {
+    cors: {
+        origin: "*", 
+        methods: ["GET", "POST"]
+    }
+});
+
 app.use(express.json());
 
 const ROLES = { OWNER: 100, ADMIN: 50, USER: 0 };
 
-// ログイン・登録APIは前回と同じなので省略（実際にはそのまま残してください）
-
-// --- Socket.io ---
+// --- オンライン管理 ---
 let onlineUsers = new Set();
 
+// 登録API
+app.post('/api/register', async (req, res) => {
+    try {
+        const { username, password } = req.body;
+        if (!username || !password) return res.status(400).json({ success: false, message: "入力が足りません" });
+        
+        const count = await prisma.user.count();
+        const role = count === 0 ? 'OWNER' : 'USER';
+        
+        await prisma.user.create({ data: { username, password, role } });
+        res.json({ success: true });
+    } catch (e) {
+        console.error(e);
+        res.status(500).json({ success: false, message: "登録失敗（既に存在する名前かもしれません）" });
+    }
+});
+
+// ログインAPI
+app.post('/api/login', async (req, res) => {
+    const { username, password } = req.body;
+    try {
+        const user = await prisma.user.findUnique({ where: { username } });
+        if (user && user.password === password) {
+            if (user.isBanned) return res.json({ success: false, message: 'BANされています' });
+            res.json({ success: true, username: user.username, userId: user.id, role: user.role });
+        } else {
+            res.json({ success: false, message: "ユーザー名またはパスワードが違います" });
+        }
+    } catch (e) {
+        res.status(500).json({ success: false });
+    }
+});
+
+// --- Socket.io ---
 io.on('connection', async (socket) => {
-    // 接続時にユーザー名を特定できないため、ログイン後にemitするように変更も可能ですが、
-    // 簡易的にソケットIDでカウントします
     onlineUsers.add(socket.id);
     io.emit('online count', onlineUsers.size);
 
-    const msgs = await prisma.message.findMany({ take: 50, orderBy: { createdAt: 'desc' } });
-    socket.emit('load messages', msgs.reverse());
+    // 履歴読み込み
+    try {
+        const msgs = await prisma.message.findMany({ take: 50, orderBy: { createdAt: 'desc' } });
+        socket.emit('load messages', msgs.reverse());
+    } catch (err) { console.error(err); }
 
+    // メッセージ送信
     socket.on('chat message', async (data) => {
         if (!data || !data.text || !data.user) return;
         try {
             const user = await prisma.user.findUnique({ where: { username: data.user } });
             if (!user || user.isBanned) return;
 
-            // ミュート期間のチェック
+            // ミュート自動解除判定
             if (user.isMuted) {
                 if (user.muteUntil && new Date() > user.muteUntil) {
-                    // 期限が過ぎていれば自動解除
                     await prisma.user.update({ where: { id: user.id }, data: { isMuted: false, muteUntil: null } });
                 } else {
                     return; // まだミュート中
@@ -45,12 +86,18 @@ io.on('connection', async (socket) => {
             }
 
             const newMsg = await prisma.message.create({
-                data: { user: data.user, text: data.text, userId: String(user.id), role: user.role }
+                data: { 
+                    user: data.user, 
+                    text: data.text, 
+                    userId: String(user.id), 
+                    role: user.role 
+                }
             });
             io.emit('chat message', newMsg);
         } catch (err) { console.error(err); }
     });
 
+    // 管理コマンド
     socket.on('admin command', async (data) => {
         try {
             const op = await prisma.user.findUnique({ where: { id: Number(data.myId) } });
@@ -58,15 +105,9 @@ io.on('connection', async (socket) => {
             if (!op || !tg || ROLES[op.role] < ROLES.ADMIN) return;
 
             let updateData = {};
-            
-            // ミュート処理 (data.minutes があれば期間限定)
             if (data.type === 'mute') {
                 updateData.isMuted = true;
-                if (data.minutes) {
-                    updateData.muteUntil = new Date(Date.now() + data.minutes * 60000);
-                } else {
-                    updateData.muteUntil = null; // 永遠
-                }
+                updateData.muteUntil = data.minutes ? new Date(Date.now() + data.minutes * 60000) : null;
             }
             if (data.type === 'unmute') { updateData.isMuted = false; updateData.muteUntil = null; }
             if (data.type === 'ban') updateData.isBanned = true;
@@ -75,8 +116,8 @@ io.on('connection', async (socket) => {
             if (data.type === 'demote' && op.role === 'OWNER') updateData.role = 'USER';
 
             if (Object.keys(updateData).length > 0) {
-                const updated = await prisma.user.update({ where: { id: tg.id }, data: updateData });
-                io.emit('system message', `${tg.username}の状態が変更されました`);
+                await prisma.user.update({ where: { id: tg.id }, data: updateData });
+                io.emit('system message', `${tg.username}のステータスを更新しました`);
             }
             if (data.type === 'delete' && data.msgId) {
                 await prisma.message.delete({ where: { id: Number(data.msgId) } });
@@ -91,4 +132,6 @@ io.on('connection', async (socket) => {
     });
 });
 
-server.listen(3000);
+// --- 修正ポイント2: PortをRender環境に合わせる ---
+const PORT = process.env.PORT || 3000;
+server.listen(PORT, () => console.log(`Server is running on port ${PORT}`));
