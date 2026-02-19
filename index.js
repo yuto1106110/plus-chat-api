@@ -11,7 +11,7 @@ app.use(express.json());
 // --- 1. MongoDB 接続設定 ---
 const MONGO_URI = process.env.DATABASE_URL;
 mongoose.connect(MONGO_URI, {
-    maxPoolSize: 50, // 同時接続枠を拡大
+    maxPoolSize: 50,
     serverSelectionTimeoutMS: 5000,
 })
 .then(() => console.log("✅ MongoDB Connected!"))
@@ -80,18 +80,37 @@ io.on('connection', async (socket) => {
     const history = await Message.find().sort({ createdAt: -1 }).limit(50).lean();
     socket.emit('load messages', history.reverse());
 
+    // 【重要】UIの状態表示ボックスに対応する取得イベント
+    socket.on('get user status', async (targetId) => {
+        try {
+            const target = await User.findOne({ userId: targetId }).lean();
+            if (!target) return;
+
+            let muteStatus = "なし";
+            if (target.muteUntil) {
+                if (target.muteUntil > new Date()) {
+                    muteStatus = target.muteUntil.getTime() > 4000000000000 ? "永久" : target.muteUntil.toLocaleString();
+                }
+            }
+
+            socket.emit('user status data', {
+                isBanned: target.isBanned,
+                isShadowBanned: target.isShadowBanned,
+                muteStatus: muteStatus
+            });
+        } catch (e) { console.error(e); }
+    });
+
     socket.on('chat message', async (data) => {
         try {
             const sender = await User.findOne({ userId: data.userId }).select('username role isBanned isShadowBanned muteUntil').lean();
             if (!sender || sender.isBanned) return;
 
-            // 連投制限
             const now = Date.now();
             if (now - (lastMessageTimes.get(data.userId) || 0) < COOLDOWN_MS) {
                 return socket.emit('system message', "連投禁止です");
             }
 
-            // ミュート
             if (sender.muteUntil && sender.muteUntil > new Date()) {
                 return socket.emit('system message', "ミュート中です");
             }
@@ -110,41 +129,54 @@ io.on('connection', async (socket) => {
 
             io.emit('chat message', msgData);
             lastMessageTimes.set(data.userId, now);
-            new Message(msgData).save(); // 非同期保存
+            new Message(msgData).save();
         } catch (e) { console.error(e); }
     });
 
     socket.on('admin command', async (data) => {
-        const admin = await User.findOne({ userId: data.myId }).select('role').lean();
-        if (!admin || (admin.role !== 'ADMIN' && admin.role !== 'OWNER')) return;
+        try {
+            const admin = await User.findOne({ userId: data.myId }).select('role').lean();
+            if (!admin || (admin.role !== 'ADMIN' && admin.role !== 'OWNER')) return;
 
-        if (data.type === 'delete') {
-            await Message.deleteOne({ id: data.msgId });
-            io.emit('delete message', data.msgId);
-        } else if (data.type === 'ban') {
-            await User.updateOne({ userId: data.targetId }, { isBanned: true });
-            io.emit('force logout user', data.targetId);
-        } else if (data.type === 'shadowban') {
-            await User.updateOne({ userId: data.targetId }, { isShadowBanned: true });
-        } else if (data.type === 'unshadowban') {
-            await User.updateOne({ userId: data.targetId }, { isShadowBanned: false });
-        } else if (data.type === 'mute') {
-            const date = data.minutes ? new Date(Date.now() + data.minutes * 60000) : new Date(8640000000000000);
-            await User.updateOne({ userId: data.targetId }, { muteUntil: date });
-        } else if (data.type === 'unmute') {
-            await User.updateOne({ userId: data.targetId }, { muteUntil: null });
-        }
+            const targetId = data.targetId;
+
+            if (data.type === 'delete') {
+                await Message.deleteOne({ id: data.msgId });
+                io.emit('delete message', data.msgId);
+            } else if (data.type === 'ban') {
+                await User.updateOne({ userId: targetId }, { isBanned: true });
+                io.emit('force logout user', targetId);
+            } else if (data.type === 'unban') {
+                await User.updateOne({ userId: targetId }, { isBanned: false });
+            } else if (data.type === 'shadowban') {
+                await User.updateOne({ userId: targetId }, { isShadowBanned: true });
+            } else if (data.type === 'unshadowban') {
+                await User.updateOne({ userId: targetId }, { isShadowBanned: false });
+            } else if (data.type === 'mute') {
+                const date = data.minutes ? new Date(Date.now() + data.minutes * 60000) : new Date(8640000000000000);
+                await User.updateOne({ userId: targetId }, { muteUntil: date });
+            } else if (data.type === 'unmute') {
+                await User.updateOne({ userId: targetId }, { muteUntil: null });
+            } else if (data.type === 'promote') {
+                await User.updateOne({ userId: targetId }, { role: 'ADMIN' });
+            } else if (data.type === 'demote') {
+                await User.updateOne({ userId: targetId }, { role: 'USER' });
+            }
+        } catch (e) { console.error(e); }
     });
 
     socket.on('admin global command', async (data) => {
-        const owner = await User.findOne({ userId: data.myId }).select('role').lean();
-        if (!owner || owner.role !== 'OWNER') return;
-        if (data.type === 'clearall') {
-            await Message.deleteMany({});
-            io.emit('clear all messages');
-        } else if (data.type === 'kickall') {
-            io.emit('force logout');
-        }
+        try {
+            const owner = await User.findOne({ userId: data.myId }).select('role').lean();
+            if (!owner || owner.role !== 'OWNER') return;
+            
+            if (data.type === 'clearall') {
+                await Message.deleteMany({});
+                io.emit('clear all messages');
+            } else if (data.type === 'kickall') {
+                io.emit('force logout');
+            }
+        } catch (e) { console.error(e); }
     });
 
     socket.on('disconnect', () => { io.emit('online count', io.engine.clientsCount); });
@@ -152,4 +184,3 @@ io.on('connection', async (socket) => {
 
 const PORT = process.env.PORT || 10000;
 server.listen(PORT, () => console.log(`🚀 API Live on ${PORT}`));
-
