@@ -8,13 +8,9 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-// MongoDB接続
 const MONGO_URI = process.env.DATABASE_URL;
-mongoose.connect(MONGO_URI, { maxPoolSize: 50 })
-    .then(() => console.log("✅ MongoDB Connected!"))
-    .catch(err => console.error("❌ DB Error:", err));
+mongoose.connect(MONGO_URI, { maxPoolSize: 50 }).then(() => console.log("✅ DB Connected"));
 
-// スキーマ
 const UserSchema = new mongoose.Schema({
     username: { type: String, required: true, unique: true },
     password: { type: String, required: true },
@@ -22,24 +18,23 @@ const UserSchema = new mongoose.Schema({
     role: { type: String, default: 'USER' },
     isBanned: { type: Boolean, default: false },
     isShadowBanned: { type: Boolean, default: false },
-    muteUntil: { type: Date, default: null }
+    muteUntil: { type: Date, default: null },
+    nameColor: { type: String, default: '#3ea6ff' } // 名前色フィールド追加
 });
 const User = mongoose.model('User', UserSchema);
 
 const MessageSchema = new mongoose.Schema({
-    id: Number, userId: String, user: String, text: String, role: String, createdAt: { type: Date, default: Date.now }
+    id: Number, userId: String, user: String, text: String, role: String, color: String, createdAt: { type: Date, default: Date.now }
 });
 const Message = mongoose.model('Message', MessageSchema);
 
 const server = http.createServer(app);
 const io = new Server(server, { cors: { origin: "*" } });
 
-const COOLDOWN_MS = 3000;
 const lastMessageTimes = new Map();
 
 function sanitize(str) { return String(str).replace(/[&<>"']/g, m => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[m])); }
 
-// 認証API
 app.post('/api/register', async (req, res) => {
     const { username, password } = req.body;
     try {
@@ -56,31 +51,27 @@ app.post('/api/login', async (req, res) => {
         const user = await User.findOne({ username, password }).lean();
         if (!user) return res.json({ success: false, message: "失敗" });
         if (user.isBanned) return res.json({ success: false, message: "BAN中" });
-        res.json({ success: true, userId: user.userId, username: user.username, role: user.role });
+        res.json({ success: true, userId: user.userId, username: user.username, role: user.role, nameColor: user.nameColor });
     } catch (e) { res.json({ success: false }); }
 });
 
-// Socket.io
 io.on('connection', async (socket) => {
     io.emit('online count', io.engine.clientsCount);
     const history = await Message.find().sort({ createdAt: -1 }).limit(50).lean();
     socket.emit('load messages', history.reverse());
 
-    // 状態取得（ミュート残り時間の計算）
+    // 名前色変更
+    socket.on('update color', async (data) => {
+        await User.updateOne({ userId: data.userId }, { nameColor: data.color });
+    });
+
     socket.on('get user status', async (tid) => {
         const t = await User.findOne({ userId: tid }).lean();
         if (!t) return;
         let m = "なし";
-        if (t.muteUntil) {
-            const now = new Date();
-            const until = new Date(t.muteUntil);
-            if (until > now) {
-                const diffMs = until.getTime() - now.getTime();
-                if (diffMs > 1000000000000) m = "永久";
-                else m = `残り約 ${Math.ceil(diffMs / 60000)} 分`;
-            } else {
-                await User.updateOne({ userId: tid }, { muteUntil: null });
-            }
+        if (t.muteUntil && t.muteUntil > new Date()) {
+            const diffMs = t.muteUntil.getTime() - Date.now();
+            m = diffMs > 1000000000 ? "永久" : `残り約 ${Math.ceil(diffMs/60000)} 分`;
         }
         socket.emit('user status data', { isBanned: t.isBanned, isShadowBanned: t.isShadowBanned, muteStatus: m });
     });
@@ -88,27 +79,29 @@ io.on('connection', async (socket) => {
     socket.on('chat message', async (data) => {
         const u = await User.findOne({ userId: data.userId }).lean();
         if (!u || u.isBanned) return;
-        if (Date.now() - (lastMessageTimes.get(data.userId) || 0) < COOLDOWN_MS) return socket.emit('system message', "連投禁止");
-        if (u.muteUntil && new Date(u.muteUntil) > new Date()) return socket.emit('system message', "ミュート中");
+        if (Date.now() - (lastMessageTimes.get(data.userId) || 0) < 2000) return;
+        if (u.muteUntil && u.muteUntil > new Date()) return;
 
-        const msg = { id: Date.now(), userId: data.userId, user: u.username, text: sanitize(data.text), role: u.role };
-        if (u.isShadowBanned) return socket.emit('chat message', msg);
-        io.emit('chat message', msg);
+        const msg = { 
+            id: Date.now(), userId: data.userId, user: u.username, 
+            text: sanitize(data.text), role: u.role, color: u.nameColor 
+        };
+        if (!u.isShadowBanned) {
+            io.emit('chat message', msg);
+            new Message(msg).save();
+        } else {
+            socket.emit('chat message', msg);
+        }
         lastMessageTimes.set(data.userId, Date.now());
-        new Message(msg).save();
     });
 
     socket.on('admin command', async (d) => {
         const a = await User.findOne({ userId: d.myId }).lean();
         if (!a || (a.role !== 'ADMIN' && a.role !== 'OWNER')) return;
-
         if (d.type === 'delete') { await Message.deleteOne({ id: d.msgId }); io.emit('delete message', d.msgId); }
         else if (d.type === 'ban') { await User.updateOne({ userId: d.targetId }, { isBanned: true }); io.emit('force logout user', d.targetId); }
-        else if (d.type === 'unban') { await User.updateOne({ userId: d.targetId }, { isBanned: false }); }
-        else if (d.type === 'shadowban') { await User.updateOne({ userId: d.targetId }, { isShadowBanned: true }); }
-        else if (d.type === 'unshadowban') { await User.updateOne({ userId: d.targetId }, { isShadowBanned: false }); }
         else if (d.type === 'mute') {
-            const dt = d.minutes ? new Date(Date.now() + parseInt(d.minutes) * 60000) : new Date(253402214400000);
+            const dt = d.minutes ? new Date(Date.now() + d.minutes * 60000) : new Date(253402214400000);
             await User.updateOne({ userId: d.targetId }, { muteUntil: dt });
         }
         else if (d.type === 'unmute') { await User.updateOne({ userId: d.targetId }, { muteUntil: null }); }
@@ -118,12 +111,14 @@ io.on('connection', async (socket) => {
 
     socket.on('admin global command', async (d) => {
         const o = await User.findOne({ userId: d.myId }).lean();
-        if (!o || o.role !== 'OWNER') return;
-        if (d.type === 'clearall') { await Message.deleteMany({}); io.emit('clear all messages'); }
-        else if (d.type === 'kickall') io.emit('force logout');
+        if (o && o.role === 'OWNER') {
+            if (d.type === 'clearall') { await Message.deleteMany({}); io.emit('clear all messages'); }
+            else if (d.type === 'kickall') io.emit('force logout');
+        }
     });
 
     socket.on('disconnect', () => io.emit('online count', io.engine.clientsCount));
 });
 
 server.listen(process.env.PORT || 10000);
+
