@@ -8,6 +8,7 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
+// --- データベース接続 ---
 const MONGO_URI = process.env.DATABASE_URL;
 mongoose.connect(MONGO_URI, { maxPoolSize: 50 }).then(() => console.log("✅ DB Connected"));
 
@@ -31,8 +32,8 @@ const MessageSchema = new mongoose.Schema({
     text: String,
     role: String,
     color: String,
-    isEdited: { type: Boolean, default: false }, // 編集済みフラグ
-    replyTo: { type: Object, default: null },   // 返信先データ {id, user, text}
+    isEdited: { type: Boolean, default: false },
+    replyTo: { type: Object, default: null }, // {id, user, text}
     createdAt: { type: Date, default: Date.now }
 });
 const Message = mongoose.model('Message', MessageSchema);
@@ -42,11 +43,12 @@ const io = new Server(server, { cors: { origin: "*" } });
 
 const lastMessageTimes = new Map();
 
-// サニタイズ関数
-function sanitize(str) { 
-    return String(str).replace(/[&<>"']/g, m => ({ 
-        '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' 
-    }[m])); 
+// --- セキュリティ：強力なサニタイズ関数 ---
+function sanitize(str) {
+    if (!str) return "";
+    return String(str).replace(/[&<>"']/g, m => ({
+        '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+    }[m]));
 }
 
 // --- API ルート ---
@@ -70,9 +72,11 @@ app.post('/api/login', async (req, res) => {
     } catch (e) { res.json({ success: false }); }
 });
 
-// --- Socket 通信 ---
+// --- Socket 通信ロジック ---
 io.on('connection', async (socket) => {
     io.emit('online count', io.engine.clientsCount);
+    
+    // 履歴取得
     const history = await Message.find().sort({ createdAt: -1 }).limit(50).lean();
     socket.emit('load messages', history.reverse());
 
@@ -81,53 +85,52 @@ io.on('connection', async (socket) => {
         await User.updateOne({ userId: data.userId }, { nameColor: data.color });
     });
 
-    // ユーザーステータス取得（権限に応じた情報の秘匿）
+    // ユーザーステータス取得
     socket.on('get user status', async (tid) => {
-        // 要求したユーザー自身の情報を特定するためには、クライアントから myId を送る必要があります。
-        // ここでは tid からのみ取得し、隠密情報の処理はフロントエンドで行うか、
-        // もしくは引数を `socket.on('get user status', async ({myId, targetId})` に変更することを推奨します。
-        // 以下は、フロントエンドとの整合性を考慮した簡易的な秘匿処理の例です。
-        
         const t = await User.findOne({ userId: tid }).lean();
         if (!t) return;
-
         let m = "なし";
         if (t.muteUntil && t.muteUntil > new Date()) {
             const diffMs = t.muteUntil.getTime() - Date.now();
             m = diffMs > 1000000000 ? "永久" : `残り約 ${Math.ceil(diffMs/60000)} 分`;
         }
-
-        // ここではデータを送りますが、隠密フラグはフロントエンド側で 
-        // 「自分が ADMIN/OWNER でないなら表示しない」というロジックで対応します。
-        socket.emit('user status data', { 
-            isBanned: t.isBanned, 
-            isShadowBanned: t.isShadowBanned, 
-            muteStatus: m 
-        });
+        // 隠密状態を含めて送信。表示の可否はフロントエンドの myRole で制御。
+        socket.emit('user status data', { isBanned: t.isBanned, isShadowBanned: t.isShadowBanned, muteStatus: m });
     });
 
-    // メッセージ送信（返信対応）
+    // メッセージ送信（返信・荒らし対策統合）
     socket.on('chat message', async (data) => {
         const u = await User.findOne({ userId: data.userId }).lean();
         if (!u || u.isBanned) return;
-        if (Date.now() - (lastMessageTimes.get(data.userId) || 0) < 2000) return;
+        if (Date.now() - (lastMessageTimes.get(data.userId) || 0) < 2000) return; // 2秒連投制限
         if (u.muteUntil && u.muteUntil > new Date()) return;
+
+        // 返信データのサニタイズ（ここが荒らし対策の肝）
+        let safeReply = null;
+        if (data.replyTo) {
+            safeReply = {
+                id: Number(data.replyTo.id),
+                user: sanitize(data.replyTo.user),
+                text: sanitize(data.replyTo.text) // 返信引用文を無害化
+            };
+        }
 
         const msg = { 
             id: Date.now(), 
             userId: data.userId, 
             user: u.username, 
-            text: sanitize(data.text), 
+            text: sanitize(data.text), // 送信本文を無害化
             role: u.role, 
             color: u.nameColor,
-            replyTo: data.replyTo || null // 返信先を追加
+            replyTo: safeReply,
+            isEdited: false
         };
 
         if (!u.isShadowBanned) {
             io.emit('chat message', msg);
             await new Message(msg).save();
         } else {
-            // 本人にだけ送る（隠密）
+            // シャドウバン中のユーザーには自分だけに表示（他人の履歴には残らない）
             socket.emit('chat message', msg);
         }
         lastMessageTimes.set(data.userId, Date.now());
@@ -137,9 +140,9 @@ io.on('connection', async (socket) => {
     socket.on('edit message', async (d) => {
         const msg = await Message.findOne({ id: d.msgId });
         if (msg && msg.userId === d.myId) {
-            const newText = sanitize(d.newText);
-            await Message.updateOne({ id: d.msgId }, { text: newText, isEdited: true });
-            io.emit('update message', { id: d.msgId, text: newText, isEdited: true });
+            const safeText = sanitize(d.newText);
+            await Message.updateOne({ id: d.msgId }, { text: safeText, isEdited: true });
+            io.emit('update message', { id: d.msgId, text: safeText, isEdited: true });
         }
     });
 
@@ -169,34 +172,19 @@ io.on('connection', async (socket) => {
             const dt = d.minutes ? new Date(Date.now() + d.minutes * 60000) : new Date(253402214400000);
             await User.updateOne({ userId: d.targetId }, { muteUntil: dt });
         }
-        else if (d.type === 'unmute') { 
-            await User.updateOne({ userId: d.targetId }, { muteUntil: null }); 
-        }
-        else if (d.type === 'promote') { 
-            await User.updateOne({ userId: d.targetId }, { role: 'ADMIN' }); 
-        }
-        else if (d.type === 'demote') { 
-            await User.updateOne({ userId: d.targetId }, { role: 'USER' }); 
-        }
-        else if (d.type === 'shadowban') {
-            await User.updateOne({ userId: d.targetId }, { isShadowBanned: true });
-        }
-        else if (d.type === 'unshadowban') {
-            await User.updateOne({ userId: d.targetId }, { isShadowBanned: false });
-        }
+        else if (d.type === 'unmute') { await User.updateOne({ userId: d.targetId }, { muteUntil: null }); }
+        else if (d.type === 'promote') { await User.updateOne({ userId: d.targetId }, { role: 'ADMIN' }); }
+        else if (d.type === 'demote') { await User.updateOne({ userId: d.targetId }, { role: 'USER' }); }
+        else if (d.type === 'shadowban') { await User.updateOne({ userId: d.targetId }, { isShadowBanned: true }); }
+        else if (d.type === 'unshadowban') { await User.updateOne({ userId: d.targetId }, { isShadowBanned: false }); }
     });
 
-    // グローバル管理者コマンド
+    // グローバル管理者コマンド（OWNER専用）
     socket.on('admin global command', async (d) => {
         const o = await User.findOne({ userId: d.myId }).lean();
         if (o && o.role === 'OWNER') {
-            if (d.type === 'clearall') { 
-                await Message.deleteMany({}); 
-                io.emit('clear all messages'); 
-            }
-            else if (d.type === 'kickall') {
-                io.emit('force logout');
-            }
+            if (d.type === 'clearall') { await Message.deleteMany({}); io.emit('clear all messages'); }
+            else if (d.type === 'kickall') io.emit('force logout');
         }
     });
 
@@ -204,5 +192,6 @@ io.on('connection', async (socket) => {
 });
 
 server.listen(process.env.PORT || 10000, () => {
-    console.log("🚀 Server is running...");
+    console.log("✅ Server version 2.0 (Reply-Secure) is running");
 });
+
