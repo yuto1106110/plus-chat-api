@@ -2,132 +2,155 @@ const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
 const cors = require('cors');
+const mongoose = require('mongoose');
 
-// --- サーバー設定 ---
 const app = express();
 app.use(cors());
 app.use(express.json());
-const server = http.createServer(app);
-const io = new Server(server, {
-    cors: { origin: "*" }
+
+// --- MongoDB 接続設定 ---
+const MONGO_URI = process.env.DATABASE_URL;
+mongoose.connect(MONGO_URI)
+    .then(() => console.log("✅ MongoDB 接続成功"))
+    .catch(err => console.error("❌ MongoDB 接続エラー:", err));
+
+// --- スキーマ定義 ---
+const UserSchema = new mongoose.Schema({
+    username: { type: String, required: true, unique: true },
+    password: { type: String, required: true },
+    userId: { type: String, required: true, unique: true },
+    role: { type: String, default: 'USER' },
+    isBanned: { type: Boolean, default: false },
+    muteUntil: { type: Date, default: null }
 });
+const User = mongoose.model('User', UserSchema);
 
-// --- 簡易データベース（実際にはMongoDB等を使うのが理想） ---
-let messages = []; // メッセージ履歴
-let users = {};    // ユーザー情報 {userId: {username, role, isBanned, muteUntil}}
-let onlineUsers = new Set();
+const MessageSchema = new mongoose.Schema({
+    id: Number,
+    userId: String,
+    user: String,
+    text: String,
+    role: String,
+    createdAt: { type: Date, default: Date.now }
+});
+const Message = mongoose.model('Message', MessageSchema);
 
-const ROLES = { OWNER: 100, ADMIN: 50, USER: 0 };
+const server = http.createServer(app);
+const io = new Server(server, { cors: { origin: "*" } });
 
-// --- 補助関数: HTMLエスケープ（サーバー側でも念のため実施） ---
-function escapeHTML(str) {
-    if (!str) return "";
-    return String(str).replace(/[&<>"']/g, m => ({
+// --- 対策設定 ---
+const COOLDOWN_MS = 3000; // 3秒間のクールダウン
+const lastMessageTimes = new Map(); // 連投監視用メモリ
+
+function sanitize(str) {
+    if (typeof str !== 'string') return "";
+    return str.replace(/[&<>"']/g, m => ({
         '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
     }[m]));
 }
 
-// --- API ルート (ログイン・登録) ---
-app.post('/api/register', (req, res) => {
+// --- API ルート ---
+app.post('/api/register', async (req, res) => {
     const { username, password } = req.body;
-    // 名前バリデーション
-    const nameRegex = /^[a-zA-Z0-9ぁ-んァ-ヶー一-龠\-_]+$/;
-    if (!nameRegex.test(username) || username.length > 15) {
-        return res.json({ success: false, message: "不正なユーザー名です" });
-    }
-    // 本来はここでDB保存（パスワードはハッシュ化すること）
-    const userId = "u_" + Math.random().toString(36).substring(2, 9);
-    users[userId] = { username, password, role: 'USER', isBanned: false, muteUntil: 0 };
-    res.json({ success: true, userId, username });
+    try {
+        if (!/^[a-zA-Z0-9ぁ-んァ-ヶー一-龠\-_]+$/.test(username)) return res.json({ success: false, message: "名前に使用できない文字が含まれています" });
+        const existing = await User.findOne({ username });
+        if (existing) return res.json({ success: false, message: "既に使われています" });
+        const userId = "u_" + Math.random().toString(36).substring(2, 10);
+        const newUser = new User({ username, password, userId, role: 'USER' });
+        await newUser.save();
+        res.json({ success: true });
+    } catch (e) { res.json({ success: false }); }
 });
 
-app.post('/api/login', (req, res) => {
+app.post('/api/login', async (req, res) => {
     const { username, password } = req.body;
-    // ユーザー検索 (簡易版)
-    const userEntry = Object.entries(users).find(([id, u]) => u.username === username && u.password === password);
-    if (userEntry) {
-        const [userId, userData] = userEntry;
-        if (userData.isBanned) return res.json({ success: false, message: "このアカウントはBANされています" });
-        res.json({ success: true, userId, username, role: userData.role });
-    } else {
-        res.json({ success: false, message: "ユーザー名またはパスワードが違います" });
-    }
+    try {
+        const user = await User.findOne({ username, password });
+        if (!user) return res.json({ success: false, message: "認証失敗" });
+        if (user.isBanned) return res.json({ success: false, message: "BANされています" });
+        res.json({ success: true, userId: user.userId, username: user.username, role: user.role });
+    } catch (e) { res.json({ success: false }); }
 });
 
-// --- Socket.io 通信 ---
-io.on('connection', (socket) => {
-    onlineUsers.add(socket.id);
-    io.emit('online count', onlineUsers.size);
+// --- Socket.io メインロジック ---
+io.on('connection', async (socket) => {
+    io.emit('online count', io.engine.clientsCount);
 
-    // 初回接続時にメッセージ履歴を送信
-    socket.emit('load messages', messages.slice(-100));
+    const history = await Message.find().sort({ createdAt: -1 }).limit(100);
+    socket.emit('load messages', history.reverse());
 
-    // メッセージ受信
-    socket.on('chat message', (data) => {
-        const { user, text } = data;
-        
-        // サーバー側バリデーション
-        if (!text || text.length > 300) return;
-        
-        const cleanText = escapeHTML(text);
-        const newMessage = {
-            id: Date.now(),
-            user: escapeHTML(user),
-            text: cleanText,
-            createdAt: new Date(),
-            role: 'USER' // 本来はuserIdから紐付け
-        };
+    socket.on('chat message', async (data) => {
+        try {
+            const now = Date.now();
+            const sender = await User.findOne({ username: data.user });
+            
+            if (!sender || sender.isBanned) return;
 
-        messages.push(newMessage);
-        if (messages.length > 200) messages.shift(); // 履歴保持制限
-        
-        io.emit('chat message', newMessage);
-    });
-
-    // 管理者コマンド（削除・BAN・ミュート）
-    socket.on('admin command', (data) => {
-        const { type, targetId, myId, msgId } = data;
-        // 本来はここで myId の権限チェックを行う
-        
-        if (type === 'delete') {
-            messages = messages.filter(m => m.id !== msgId);
-            io.emit('delete message', msgId);
-        }
-        
-        if (type === 'ban') {
-            if (users[targetId]) {
-                users[targetId].isBanned = true;
-                // BAN対象を強制切断させる命令を送るなどの処理
+            // 【対策】連投チェック
+            const lastTime = lastMessageTimes.get(sender.userId) || 0;
+            if (now - lastTime < COOLDOWN_MS) {
+                return socket.emit('system message', "連投は禁止です。少し待ってください。");
             }
+
+            // 【対策】バリデーション
+            const cleanText = data.text ? data.text.trim() : "";
+            if (!cleanText || cleanText.length > 500) return;
+
+            // ミュートチェック
+            if (sender.muteUntil && sender.muteUntil > new Date()) {
+                return socket.emit('system message', "現在ミュートされています。");
+            }
+
+            const newMessage = new Message({
+                id: now,
+                userId: sender.userId,
+                user: sanitize(sender.username),
+                text: sanitize(cleanText),
+                role: sender.role
+            });
+
+            await newMessage.save();
+            lastMessageTimes.set(sender.userId, now); // クールダウン更新
+            io.emit('chat message', newMessage);
+
+        } catch (e) { console.error(e); }
+    });
+
+    // 管理者操作
+    socket.on('admin command', async (data) => {
+        const admin = await User.findOne({ userId: data.myId });
+        if (!admin || (admin.role !== 'ADMIN' && admin.role !== 'OWNER')) return;
+
+        if (data.type === 'delete') {
+            await Message.deleteOne({ id: data.msgId });
+            io.emit('delete message', data.msgId);
+        } else if (data.type === 'ban') {
+            await User.updateOne({ userId: data.targetId }, { isBanned: true });
+        } else if (data.type === 'mute') {
+            const date = data.minutes ? new Date(Date.now() + data.minutes * 60000) : new Date(8640000000000000);
+            await User.updateOne({ userId: data.targetId }, { muteUntil: date });
         }
     });
 
-    // 全体管理者コマンド (OWNER専用)
-    socket.on('admin global command', (data) => {
-        const { type, myId } = data;
-        
-        // 全員強制退出
-        if (type === 'kickall') {
-            io.emit('force logout'); 
-        }
+    // 全体操作
+    socket.on('admin global command', async (data) => {
+        const owner = await User.findOne({ userId: data.myId });
+        if (!owner || owner.role !== 'OWNER') return;
 
-        // メッセージ全消去
-        if (type === 'clearall') {
-            messages = [];
+        if (data.type === 'clearall') {
+            await Message.deleteMany({});
             io.emit('clear all messages');
-            io.emit('chat message', { id: 0, user: "SYSTEM", text: "管理者が履歴を全消去しました", role: "ADMIN" });
+        } else if (data.type === 'kickall') {
+            io.emit('force logout');
         }
     });
 
     socket.on('disconnect', () => {
-        onlineUsers.delete(socket.id);
-        io.emit('online count', onlineUsers.size);
+        io.emit('online count', io.engine.clientsCount);
     });
 });
 
-// ポート設定（Render等の環境変数に対応）
 const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => {
-    console.log(`Server is running on port ${PORT}`);
-});
+server.listen(PORT, () => console.log(`🚀 Security Plus Server Port ${PORT}`));
 
