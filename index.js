@@ -10,17 +10,21 @@ app.use(express.json());
 
 // --- 1. MongoDB 接続設定 ---
 const MONGO_URI = process.env.DATABASE_URL;
-mongoose.connect(MONGO_URI)
-    .then(() => console.log("✅ MongoDB Connected!"))
-    .catch(err => console.error("❌ MongoDB Connection Error:", err));
+mongoose.connect(MONGO_URI, {
+    maxPoolSize: 50, // 同時接続枠を拡大
+    serverSelectionTimeoutMS: 5000,
+})
+.then(() => console.log("✅ MongoDB Connected!"))
+.catch(err => console.error("❌ MongoDB Connection Error:", err));
 
-// --- 2. スキーマ（データ構造）定義 ---
+// --- 2. スキーマ定義 ---
 const UserSchema = new mongoose.Schema({
     username: { type: String, required: true, unique: true },
     password: { type: String, required: true },
     userId: { type: String, required: true, unique: true },
     role: { type: String, default: 'USER' },
     isBanned: { type: Boolean, default: false },
+    isShadowBanned: { type: Boolean, default: false },
     muteUntil: { type: Date, default: null }
 });
 const User = mongoose.model('User', UserSchema);
@@ -38,99 +42,80 @@ const Message = mongoose.model('Message', MessageSchema);
 const server = http.createServer(app);
 const io = new Server(server, { cors: { origin: "*" } });
 
-// --- 3. セキュリティ設定 ---
-const COOLDOWN_MS = 2500; // 2.5秒の連投制限
+const COOLDOWN_MS = 2500;
 const lastMessageTimes = new Map();
 
 function sanitize(str) {
     if (typeof str !== 'string') return "";
-    return str.replace(/[&<>"']/g, m => ({
-        '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
-    }[m]));
+    return str.replace(/[&<>"']/g, m => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[m]));
 }
 
-// --- 4. API (登録・ログイン) ---
+// --- 3. API (認証) ---
 app.post('/api/register', async (req, res) => {
     const { username, password } = req.body;
     try {
-        if (!/^[a-zA-Z0-9ぁ-んァ-ヶー一-龠\-_]+$/.test(username)) {
-            return res.json({ success: false, message: "名前に特殊記号は使えません" });
-        }
-        const existing = await User.findOne({ username });
-        if (existing) return res.json({ success: false, message: "この名前は既に使われています" });
-
+        const existing = await User.findOne({ username }).lean();
+        if (existing) return res.json({ success: false, message: "既に使われています" });
         const userId = "u_" + Math.random().toString(36).substring(2, 12);
-        const newUser = new User({ username, password, userId, role: 'USER' });
+        const newUser = new User({ username, password, userId });
         await newUser.save();
         res.json({ success: true });
-    } catch (e) { res.json({ success: false, message: "登録エラー" }); }
+    } catch (e) { res.json({ success: false }); }
 });
 
 app.post('/api/login', async (req, res) => {
     const { username, password } = req.body;
     try {
-        const user = await User.findOne({ username, password });
-        if (!user) return res.json({ success: false, message: "認証に失敗しました" });
-        if (user.isBanned) return res.json({ success: false, message: "あなたはBANされています" });
-
-        res.json({ 
-            success: true, 
-            userId: user.userId, 
-            username: user.username, 
-            role: user.role,
-            muteUntil: user.muteUntil 
-        });
+        const user = await User.findOne({ username, password }).lean();
+        if (!user) return res.json({ success: false, message: "認証失敗" });
+        if (user.isBanned) return res.json({ success: false, message: "BANされています" });
+        res.json({ success: true, userId: user.userId, username: user.username, role: user.role });
     } catch (e) { res.json({ success: false }); }
 });
 
-// --- 5. Socket.io 通信ロジック ---
+// --- 4. Socket.io ---
 io.on('connection', async (socket) => {
     io.emit('online count', io.engine.clientsCount);
 
-    // 履歴取得
-    const history = await Message.find().sort({ createdAt: -1 }).limit(100);
+    const history = await Message.find().sort({ createdAt: -1 }).limit(50).lean();
     socket.emit('load messages', history.reverse());
 
-    // メッセージ受信
     socket.on('chat message', async (data) => {
         try {
-            const sender = await User.findOne({ userId: data.userId });
+            const sender = await User.findOne({ userId: data.userId }).select('username role isBanned isShadowBanned muteUntil').lean();
             if (!sender || sender.isBanned) return;
 
-            // 【対策】連投制限
+            // 連投制限
             const now = Date.now();
-            const lastTime = lastMessageTimes.get(sender.userId) || 0;
-            if (now - lastTime < COOLDOWN_MS) {
-                return socket.emit('system message', "連投禁止です。少し待ってください。");
+            if (now - (lastMessageTimes.get(data.userId) || 0) < COOLDOWN_MS) {
+                return socket.emit('system message', "連投禁止です");
             }
 
-            // 【対策】ミュート
+            // ミュート
             if (sender.muteUntil && sender.muteUntil > new Date()) {
-                const remains = Math.ceil((sender.muteUntil - new Date()) / 60000);
-                return socket.emit('system message', `ミュート中です。残り約${remains}分`);
+                return socket.emit('system message', "ミュート中です");
             }
 
-            const cleanText = data.text ? data.text.trim() : "";
-            if (!cleanText || cleanText.length > 500) return;
-
-            const newMessage = new Message({
+            const msgData = {
                 id: now,
-                userId: sender.userId,
+                userId: data.userId,
                 user: sender.username,
-                text: sanitize(cleanText),
+                text: sanitize(data.text),
                 role: sender.role
-            });
+            };
 
-            await newMessage.save();
-            lastMessageTimes.set(sender.userId, now);
-            io.emit('chat message', newMessage);
+            if (sender.isShadowBanned) {
+                return socket.emit('chat message', msgData); // 本人にのみ返す
+            }
 
+            io.emit('chat message', msgData);
+            lastMessageTimes.set(data.userId, now);
+            new Message(msgData).save(); // 非同期保存
         } catch (e) { console.error(e); }
     });
 
-    // 管理者コマンド (BAN, MUTE, DELETE)
     socket.on('admin command', async (data) => {
-        const admin = await User.findOne({ userId: data.myId });
+        const admin = await User.findOne({ userId: data.myId }).select('role').lean();
         if (!admin || (admin.role !== 'ADMIN' && admin.role !== 'OWNER')) return;
 
         if (data.type === 'delete') {
@@ -138,22 +123,22 @@ io.on('connection', async (socket) => {
             io.emit('delete message', data.msgId);
         } else if (data.type === 'ban') {
             await User.updateOne({ userId: data.targetId }, { isBanned: true });
-            io.emit('force logout user', data.targetId); // 特定ユーザーを追い出す
+            io.emit('force logout user', data.targetId);
+        } else if (data.type === 'shadowban') {
+            await User.updateOne({ userId: data.targetId }, { isShadowBanned: true });
+        } else if (data.type === 'unshadowban') {
+            await User.updateOne({ userId: data.targetId }, { isShadowBanned: false });
         } else if (data.type === 'mute') {
             const date = data.minutes ? new Date(Date.now() + data.minutes * 60000) : new Date(8640000000000000);
             await User.updateOne({ userId: data.targetId }, { muteUntil: date });
-            io.emit('update user status', { userId: data.targetId, muteUntil: date });
         } else if (data.type === 'unmute') {
             await User.updateOne({ userId: data.targetId }, { muteUntil: null });
-            io.emit('update user status', { userId: data.targetId, muteUntil: null });
         }
     });
 
-    // グローバルコマンド (OWNER専用: CLEARALL, KICKALL)
     socket.on('admin global command', async (data) => {
-        const owner = await User.findOne({ userId: data.myId });
+        const owner = await User.findOne({ userId: data.myId }).select('role').lean();
         if (!owner || owner.role !== 'OWNER') return;
-
         if (data.type === 'clearall') {
             await Message.deleteMany({});
             io.emit('clear all messages');
@@ -162,11 +147,9 @@ io.on('connection', async (socket) => {
         }
     });
 
-    socket.on('disconnect', () => {
-        io.emit('online count', io.engine.clientsCount);
-    });
+    socket.on('disconnect', () => { io.emit('online count', io.engine.clientsCount); });
 });
 
-const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => console.log(`🚀 Final Version Server Port ${PORT}`));
+const PORT = process.env.PORT || 10000;
+server.listen(PORT, () => console.log(`🚀 API Live on ${PORT}`));
 
