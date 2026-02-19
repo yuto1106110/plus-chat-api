@@ -8,7 +8,7 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-// MongoDB 接続
+// MongoDB接続
 const MONGO_URI = process.env.DATABASE_URL;
 mongoose.connect(MONGO_URI, { maxPoolSize: 50 })
     .then(() => console.log("✅ MongoDB Connected!"))
@@ -34,12 +34,12 @@ const Message = mongoose.model('Message', MessageSchema);
 const server = http.createServer(app);
 const io = new Server(server, { cors: { origin: "*" } });
 
-const COOLDOWN_MS = 2500;
+const COOLDOWN_MS = 3000;
 const lastMessageTimes = new Map();
 
 function sanitize(str) { return String(str).replace(/[&<>"']/g, m => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[m])); }
 
-// API
+// 認証API
 app.post('/api/register', async (req, res) => {
     const { username, password } = req.body;
     try {
@@ -55,7 +55,7 @@ app.post('/api/login', async (req, res) => {
     try {
         const user = await User.findOne({ username, password }).lean();
         if (!user) return res.json({ success: false, message: "失敗" });
-        if (user.isBanned) return res.json({ success: false, message: "BAN" });
+        if (user.isBanned) return res.json({ success: false, message: "BAN中" });
         res.json({ success: true, userId: user.userId, username: user.username, role: user.role });
     } catch (e) { res.json({ success: false }); }
 });
@@ -66,13 +66,21 @@ io.on('connection', async (socket) => {
     const history = await Message.find().sort({ createdAt: -1 }).limit(50).lean();
     socket.emit('load messages', history.reverse());
 
-    // 状態取得
+    // 状態取得（ミュート残り時間の計算）
     socket.on('get user status', async (tid) => {
         const t = await User.findOne({ userId: tid }).lean();
         if (!t) return;
         let m = "なし";
-        if (t.muteUntil && t.muteUntil > new Date()) {
-            m = t.muteUntil.getTime() > 4000000000000 ? "永久" : t.muteUntil.toLocaleString();
+        if (t.muteUntil) {
+            const now = new Date();
+            const until = new Date(t.muteUntil);
+            if (until > now) {
+                const diffMs = until.getTime() - now.getTime();
+                if (diffMs > 1000000000000) m = "永久";
+                else m = `残り約 ${Math.ceil(diffMs / 60000)} 分`;
+            } else {
+                await User.updateOne({ userId: tid }, { muteUntil: null });
+            }
         }
         socket.emit('user status data', { isBanned: t.isBanned, isShadowBanned: t.isShadowBanned, muteStatus: m });
     });
@@ -81,7 +89,7 @@ io.on('connection', async (socket) => {
         const u = await User.findOne({ userId: data.userId }).lean();
         if (!u || u.isBanned) return;
         if (Date.now() - (lastMessageTimes.get(data.userId) || 0) < COOLDOWN_MS) return socket.emit('system message', "連投禁止");
-        if (u.muteUntil && u.muteUntil > new Date()) return socket.emit('system message', "ミュート中");
+        if (u.muteUntil && new Date(u.muteUntil) > new Date()) return socket.emit('system message', "ミュート中");
 
         const msg = { id: Date.now(), userId: data.userId, user: u.username, text: sanitize(data.text), role: u.role };
         if (u.isShadowBanned) return socket.emit('chat message', msg);
@@ -100,7 +108,7 @@ io.on('connection', async (socket) => {
         else if (d.type === 'shadowban') { await User.updateOne({ userId: d.targetId }, { isShadowBanned: true }); }
         else if (d.type === 'unshadowban') { await User.updateOne({ userId: d.targetId }, { isShadowBanned: false }); }
         else if (d.type === 'mute') {
-            const dt = d.minutes ? new Date(Date.now() + d.minutes * 60000) : new Date(8640000000000000);
+            const dt = d.minutes ? new Date(Date.now() + parseInt(d.minutes) * 60000) : new Date(253402214400000);
             await User.updateOne({ userId: d.targetId }, { muteUntil: dt });
         }
         else if (d.type === 'unmute') { await User.updateOne({ userId: d.targetId }, { muteUntil: null }); }
