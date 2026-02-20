@@ -52,7 +52,7 @@ const connectedUsers = new Map();
 const ipConnections = {}; 
 
 // --- 設定値 ---
-const MAX_CONNS_PER_IP = 10; // 制限を3から10に緩和（一般利用に最適化）
+const MAX_CONNS_PER_IP = 30; 
 const AUTO_MUTE_MINUTES = 10;
 const SPAM_THRESHOLD = 5;
 const SPAM_INTERVAL = 3000;
