@@ -6,7 +6,7 @@ const mongoose = require('mongoose');
 
 const app = express();
 
-// --- セキュリティ対策：CORS設定をルートの最初に配置 ---
+// --- CORS設定 ---
 app.use(cors({
     origin: "*", 
     methods: ["GET", "POST"],
@@ -40,10 +40,18 @@ const MessageSchema = new mongoose.Schema({
 const Message = mongoose.model('Message', MessageSchema);
 
 const server = http.createServer(app);
-const io = new Server(server, { cors: { origin: "*" } });
+const io = new Server(server, { 
+    cors: { origin: "*" },
+    pingTimeout: 30000,
+    pingInterval: 10000
+});
 
-// --- 防衛システム用変数 ---
+// --- 防衛・管理用変数 ---
 const spamTrack = new Map();
+const connectedUsers = new Map(); // userId -> socketId (ユニークユーザー管理用)
+const ipConnections = {}; // IP -> 接続数 (IP制限用)
+
+const MAX_CONNS_PER_IP = 3; // 同一IPからの同時接続を3つに制限
 const AUTO_MUTE_MINUTES = 10;
 const SPAM_THRESHOLD = 5;
 const SPAM_INTERVAL = 3000;
@@ -55,10 +63,29 @@ function sanitize(str) {
     }[m]));
 }
 
+// オンライン人数を正確に通知（ログイン済みユニークユーザーのみ）
+function broadcastOnlineCount() {
+    const uniqueCount = new Set(connectedUsers.keys()).size;
+    io.emit('online count', uniqueCount);
+}
+
+// --- Socket.io ミドルウェア (接続制限) ---
+io.use((socket, next) => {
+    const ip = socket.handshake.address;
+    ipConnections[ip] = (ipConnections[ip] || 0) + 1;
+
+    if (ipConnections[ip] > MAX_CONNS_PER_IP) {
+        console.log(`⚠️ Blocked excessive connections from IP: ${ip}`);
+        return next(new Error('Too many connections'));
+    }
+    next();
+});
+
 // --- API ルート ---
 app.post('/api/register', async (req, res) => {
     try {
         const { username, password } = req.body;
+        if (username.length > 15) return res.json({ success: false, message: "名前が長すぎます" });
         if (await User.findOne({ username }).lean()) return res.json({ success: false, message: "この名前は使用されています" });
         const userId = "u_" + Math.random().toString(36).substring(2, 12);
         await new User({ username, password, userId }).save();
@@ -76,17 +103,26 @@ app.post('/api/login', async (req, res) => {
     } catch (e) { res.status(500).json({ success: false, message: "サーバーエラー" }); }
 });
 
-// --- Socket.io ---
+// --- Socket.io メインロジック ---
 io.on('connection', async (socket) => {
-    io.emit('online count', io.engine.clientsCount);
+    const ip = socket.handshake.address;
+
+    // 初回ロード
     const history = await Message.find().sort({ createdAt: -1 }).limit(50).lean();
     socket.emit('load messages', history.reverse());
+    broadcastOnlineCount();
 
     socket.on('chat message', async (data) => {
+        if (!data.text || data.text.length > 300) return;
+
         const u = await User.findOne({ userId: data.userId }).lean();
         if (!u || u.isBanned || (u.muteUntil && u.muteUntil > new Date())) return;
 
-        // 自動ミュートロジック
+        // ログインを確認したユーザーとして登録
+        connectedUsers.set(data.userId, socket.id);
+        broadcastOnlineCount();
+
+        // スパムチェック
         const now = Date.now();
         const track = spamTrack.get(data.userId) || { count: 0, lastTime: now };
         if (now - track.lastTime < SPAM_INTERVAL) track.count++; else track.count = 1;
@@ -100,7 +136,6 @@ io.on('connection', async (socket) => {
             return;
         }
 
-        // 本文と返信先の両方をサニタイズ
         let safeReply = null;
         if (data.replyTo) {
             safeReply = { 
@@ -123,7 +158,7 @@ io.on('connection', async (socket) => {
         }
     });
 
-    // 管理者・編集・削除コマンド（中略：以前のロジックと同じものを統合）
+    // メッセージ編集
     socket.on('edit message', async (d) => {
         const msg = await Message.findOne({ id: d.msgId });
         if (msg && msg.userId === d.myId) {
@@ -133,28 +168,35 @@ io.on('connection', async (socket) => {
         }
     });
 
+    // 管理コマンド
     socket.on('admin command', async (d) => {
         const a = await User.findOne({ userId: d.myId }).lean();
         if (!a || (a.role !== 'ADMIN' && a.role !== 'OWNER')) return;
-        if (d.type === 'delete') { await Message.deleteOne({ id: d.msgId }); io.emit('delete message', d.msgId); }
-        else if (d.type === 'ban') { await User.updateOne({ userId: d.targetId }, { isBanned: true }); io.emit('force logout user', d.targetId); }
-        else if (d.type === 'unban') { await User.updateOne({ userId: d.targetId }, { isBanned: false }); }
-        else if (d.type === 'mute') {
+        if (d.type === 'delete') { 
+            await Message.deleteOne({ id: d.msgId }); 
+            io.emit('delete message', d.msgId); 
+        } else if (d.type === 'ban') { 
+            await User.updateOne({ userId: d.targetId }, { isBanned: true }); 
+            io.emit('force logout user', d.targetId); 
+        } else if (d.type === 'mute') {
             const dt = d.minutes ? new Date(Date.now() + d.minutes * 60000) : new Date(253402214400000);
             await User.updateOne({ userId: d.targetId }, { muteUntil: dt });
         }
     });
 
-    socket.on('admin global command', async (d) => {
-        const o = await User.findOne({ userId: d.myId }).lean();
-        if (o && o.role === 'OWNER') {
-            if (d.type === 'clearall') { await Message.deleteMany({}); io.emit('clear all messages'); }
-            else if (d.type === 'kickall') io.emit('force logout');
+    socket.on('disconnect', () => {
+        // IP接続数の掃除
+        if (ipConnections[ip]) ipConnections[ip]--;
+        
+        // ユーザーマップの掃除
+        for (let [uid, sid] of connectedUsers.entries()) {
+            if (sid === socket.id) {
+                connectedUsers.delete(uid);
+                break;
+            }
         }
+        broadcastOnlineCount();
     });
-
-    socket.on('disconnect', () => io.emit('online count', io.engine.clientsCount));
 });
 
-server.listen(process.env.PORT || 10000, () => console.log("🚀 Server Ready"));
-
+server.listen(process.env.PORT || 10000, () => console.log("🚀 Server Shielded Ready"));
